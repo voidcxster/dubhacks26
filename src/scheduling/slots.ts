@@ -1,4 +1,4 @@
-import { addMinutes, clock, localParts, optionLabel, ZONE } from "../time.ts";
+import { addMinutes, clock, dayLabel, localParts, optionLabel, shiftDay, weekdayIndex, ymd, zonedDate, ZONE } from "../time.ts";
 
 export type Range = {
   personId: string;
@@ -186,14 +186,16 @@ export function suggestOpenSlots(input: {
   preferred?: Date[];
   earliest?: Date;
   latest?: Date;
-}): { slots: SlotOption[]; notes: string[] } {
+  windowLabel?: string;
+}): { slots: SlotOption[]; notes: string[]; windowLabel: string } {
   const zone = input.zone ?? ZONE;
   const bufferMin = input.locus === "in_person" ? 30 : 0;
   const earliest = input.earliest ?? input.now;
   const latest = input.latest ?? addMinutes(input.now, 48 * 60);
+  const windowLabel = input.windowLabel ?? "through tomorrow evening";
   const mine = input.ranges.filter((range) => range.personId === input.personId);
   const busy = mine.filter((range) => range.kind === "busy");
-  const opens = mine.filter((range) => range.kind === "free" && range.open && !range.point);
+  const opens = mine.filter((range) => range.kind === "free" && range.open && !range.point && range.end > earliest && range.start < latest);
   const notes = new Set<string>();
 
   const fits = (start: Date): boolean => {
@@ -208,14 +210,14 @@ export function suggestOpenSlots(input: {
 
   const preferred = (input.preferred ?? []).filter((start) => {
     if (fits(start)) return true;
-    if (start >= input.now && blockedUntil(busy, start, addMinutes(start, input.durationMin), bufferMin)) {
-      notes.add(`${optionLabel(start, input.now, zone)} overlaps your calendar.`);
-    }
+    const block = blockedUntil(busy, start, addMinutes(start, input.durationMin), bufferMin);
+    if (start >= earliest && start < latest && block) notes.add(conflictNote(block, start, input.now, zone));
     return false;
   });
 
   const grid: Date[] = [];
-  for (let cursor = ceil30(input.now), guard = 0; guard < 96 && cursor < latest; guard += 1) {
+  let cursor = ceil30(earliest > input.now ? earliest : input.now);
+  for (let guard = 0; guard < 14 * 48 && cursor < latest; guard += 1) {
     if (fits(cursor)) grid.push(cursor);
     cursor = addMinutes(cursor, 30);
   }
@@ -237,15 +239,14 @@ export function suggestOpenSlots(input: {
   const first = chosen[0];
   if (first) {
     const covering = busy
-      .filter((range) => range.source !== "chat" && range.end > input.now && range.start <= first)
+      .filter((range) => range.source !== "chat" && range.end > earliest && range.start < latest && range.start <= first)
       .sort((a, b) => b.end.getTime() - a.end.getTime())[0];
-    if (covering) notes.add(`You're busy until ${clock(covering.end, zone)}.`);
-  } else {
-    notes.add("Your calendar has no open block long enough through tomorrow evening.");
+    if (covering && covering.end <= first) notes.add(`You're busy until ${clock(covering.end, zone)}.`);
   }
 
   return {
     notes: [...notes],
+    windowLabel,
     slots: chosen.map((start) => ({
       start,
       end: addMinutes(start, input.durationMin),
@@ -287,4 +288,118 @@ export function pickSlot(text: string, slots: { label: string; start: Date }[], 
     return [index];
   });
   return hits.length === 1 ? hits[0]! : null;
+}
+
+export function conflictNote(range: Range, start: Date, now: Date, zone = ZONE): string {
+  const when = optionLabel(start, now, zone);
+  const until = clock(range.end, zone);
+  if (range.source === "google") return `${when} conflicts with your Google Calendar until ${until}.`;
+  return `${when} conflicts with something already planned in this chat until ${until}.`;
+}
+
+const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+export function searchWindow(text: string, now: Date, zone = ZONE): {
+  earliest: Date;
+  latest: Date;
+  label: string;
+  named: boolean;
+} {
+  const inDays = text.match(/\bin\s+(\d+)\s+days?\b/i);
+  const weekday = text.toLowerCase().match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  const dayAt = (offset: number, hour: number, minute = 0) => zonedDate(shiftDay(now, offset, zone), hour, minute, zone);
+  if (inDays) {
+    const offset = Number(inDays[1]);
+    const earliest = dayAt(offset, 9);
+    return { earliest, latest: dayAt(offset, 21), label: dayLabel(earliest, now, zone), named: true };
+  }
+  if (weekday) {
+    const target = weekdays.indexOf(weekday[1] ?? "");
+    const current = weekdayIndex(now, zone);
+    let offset = (target - current + 7) % 7;
+    if (offset === 0 && new RegExp(`\\bnext\\s+${weekday[1]}\\b`, "i").test(text)) offset = 7;
+    const earliest = offset === 0 ? now : dayAt(offset, 9);
+    return { earliest, latest: dayAt(offset, 21), label: offset === 0 ? "today" : dayLabel(earliest, now, zone), named: true };
+  }
+  if (/\bnext week\b/i.test(text)) {
+    const current = weekdayIndex(now, zone);
+    const monday = ((1 - current + 7) % 7) || 7;
+    const earliest = dayAt(monday, 9);
+    return { earliest, latest: dayAt(monday + 6, 21), label: "next week", named: true };
+  }
+  if (/\btomorrow\b/i.test(text)) {
+    const earliest = dayAt(1, 9);
+    return { earliest, latest: dayAt(1, 21), label: "tomorrow", named: true };
+  }
+  if (/\b(today|tonight)\b/i.test(text)) {
+    return { earliest: now, latest: dayAt(0, 21), label: "today", named: true };
+  }
+  return { earliest: now, latest: addMinutes(now, 48 * 60), label: "through tomorrow evening", named: false };
+}
+
+export function formatOffer(input: {
+  title: string;
+  slots: { label: string }[];
+  notes: string[];
+  connectUrl: string | null;
+  windowLabel?: string;
+}): string {
+  const conflicts = input.notes.filter((note) => note.includes("conflicts with"));
+  const other = input.notes.filter((note) => !note.includes("conflicts with"));
+  const windowLabel = input.windowLabel ?? "through tomorrow evening";
+  const lines = [...conflicts];
+  if (input.slots.length === 0) {
+    const span = windowLabel.startsWith("through") ? windowLabel : `on ${windowLabel}`;
+    lines.push(`No open time left for ${input.title} ${span}.`);
+  } else {
+    lines.push(`Pick a time for ${input.title}:`);
+    lines.push(...input.slots.map((slot, index) => `${index + 1}. ${slot.label}`));
+    lines.push("Reply with a number.");
+  }
+  lines.push(...other);
+  if (input.connectUrl) lines.push(`Connect Google Calendar to include the rest of your schedule: ${input.connectUrl}`);
+  return lines.join("\n");
+}
+
+export function resolveSpokenTime(text: string, now: Date, zone = ZONE): Date | null {
+  const match = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] ?? "0");
+  const mer = match[3]?.toLowerCase();
+  if (hour > 12 || minute > 59 || minute % 30 !== 0) return null;
+  if (mer === "pm" && hour < 12) hour += 12;
+  if (mer === "am" && hour === 12) hour = 0;
+  const window = searchWindow(text, now, zone);
+  let cursor = ceil30(window.earliest > now ? window.earliest : now);
+  for (let guard = 0; guard < 14 * 48 && cursor < window.latest; guard += 1) {
+    const parts = localParts(cursor, zone);
+    if (parts.hour === hour && parts.minute === minute && cursor >= now) return cursor;
+    cursor = addMinutes(cursor, 30);
+  }
+  return null;
+}
+
+function numberedLines(text: string): string {
+  return [...text.matchAll(/^\d+\. .+$/gm)].map((match) => match[0]).join("\n");
+}
+
+export function isConfusion(text: string): boolean {
+  return /^(?:what|huh|wait|sorry|again|repeat|confused|which)(?:\s+one|\s+do you mean)?[.?!]*$|^i don'?t (?:understand|get it)[.?!]*$|^\?+$/i.test(text.trim());
+}
+
+export function decideOutgoing(input: {
+  next: string | null;
+  previous: string | null;
+  latestUser: string;
+}): string | null {
+  if (!input.next) return null;
+  const previousSlots = input.previous ? numberedLines(input.previous) : "";
+  const nextSlots = numberedLines(input.next);
+  const sameList = previousSlots.length > 0 && previousSlots === nextSlots;
+  if (!sameList) return input.next;
+  if (isConfusion(input.latestUser)) return `Here they are again:\n${input.next}`;
+  const conflicts = input.next.split("\n").filter((line) => line.includes("conflicts with") && !input.previous!.includes(line));
+  if (conflicts.length > 0) return conflicts.join("\n");
+  return null;
 }

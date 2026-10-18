@@ -27,7 +27,7 @@ import {
 } from "./db.ts";
 import { env } from "./env.ts";
 import { addMinutes, clock, dayLabel, optionLabel } from "./time.ts";
-import { buildCandidates, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
+import { buildCandidates, formatOffer, searchWindow, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
 
 type ToolSpace = Space & { send: (content: unknown) => Promise<{ content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] } }> };
 
@@ -56,7 +56,7 @@ export async function linkMembers(threadId: string, people: Person[]): Promise<v
 
 async function refreshCalendars(threadId: string, people: Person[]): Promise<void> {
   const start = new Date();
-  const end = addMinutes(start, 7 * 24 * 60);
+  const end = addMinutes(start, 14 * 24 * 60);
   for (const person of people) {
     if (!person.google_refresh_token) continue;
     try {
@@ -269,31 +269,6 @@ export async function applyAvailability(input: {
   return `Saved ${input.kind} ${start.toISOString()} to ${end.toISOString()} for ${person.phone}.`;
 }
 
-function suggestionText(input: {
-  title: string;
-  slots: { label: string }[];
-  notes: string[];
-  connectUrl: string | null;
-}): string {
-  if (input.slots.length === 0) {
-    const lines = [
-      `I checked your calendar for ${input.title} and there's no open block long enough through tomorrow evening.`,
-      ...input.notes,
-    ];
-    if (input.connectUrl) lines.push(`Connect Google Calendar so I can see when you're free: ${input.connectUrl}`);
-    return lines.join("\n");
-  }
-  const lines = [
-    `For ${input.title}, these times are open:`,
-    ...input.slots.map((slot, index) => `${index + 1}. ${slot.label}`),
-    ...input.notes,
-    "Reply with one and I'll put it on your calendar.",
-  ];
-  if (input.connectUrl) {
-    lines.push(`Your calendar isn't connected yet, so this misses events I can't see. Connect it: ${input.connectUrl}`);
-  }
-  return lines.join("\n");
-}
 
 export async function offerTimes(input: {
   threadId: string;
@@ -303,23 +278,35 @@ export async function offerTimes(input: {
   locus: "in_person" | "remote";
   earliest?: string;
   latest?: string;
+  requested?: string;
+  requestText?: string;
 }): Promise<{ text: string; slots: { label: string; start: string }[] }> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
   await refreshCalendars(input.threadId, [person]);
   const ranges = await loadRanges(input.threadId, [person.id]);
   const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
-  const earliest = input.earliest ? new Date(input.earliest) : undefined;
-  const latest = input.latest ? new Date(input.latest) : undefined;
+  const now = new Date();
+  const spoken = searchWindow(input.requestText ?? "", now);
+  const modelEarliest = input.earliest ? new Date(input.earliest) : undefined;
+  const modelLatest = input.latest ? new Date(input.latest) : undefined;
+  const earliest = spoken.named ? spoken.earliest : modelEarliest && !Number.isNaN(modelEarliest.getTime()) ? modelEarliest : spoken.earliest;
+  const latest = spoken.named ? spoken.latest : modelLatest && !Number.isNaN(modelLatest.getTime()) ? modelLatest : spoken.latest;
+  const requested = input.requested ? new Date(input.requested) : undefined;
+  const preferred = ranges
+    .filter((range) => range.kind === "free" && range.point && range.start >= earliest && range.start < latest)
+    .map((range) => range.start);
+  if (requested && !Number.isNaN(requested.getTime()) && requested >= earliest && requested < latest) preferred.push(requested);
   const built = suggestOpenSlots({
-    now: new Date(),
+    now,
     durationMin,
     locus: input.locus,
     personId: person.id,
     ranges,
-    preferred: ranges.filter((range) => range.kind === "free" && range.point).map((range) => range.start),
-    earliest: earliest && !Number.isNaN(earliest.getTime()) ? earliest : undefined,
-    latest: latest && !Number.isNaN(latest.getTime()) ? latest : undefined,
+    preferred,
+    earliest,
+    latest,
+    windowLabel: spoken.label,
   });
   await replaceProposed(input.threadId);
   if (built.slots.length > 0) {
@@ -333,7 +320,7 @@ export async function offerTimes(input: {
   }
   const connectUrl = person.google_refresh_token ? null : authUrl(person.id);
   return {
-    text: suggestionText({ title: input.title, slots: built.slots, notes: built.notes, connectUrl }),
+    text: formatOffer({ title: input.title, slots: built.slots, notes: built.notes, connectUrl, windowLabel: built.windowLabel }),
     slots: built.slots.map((slot) => ({ label: slot.label, start: slot.start.toISOString() })),
   };
 }
@@ -345,14 +332,16 @@ export async function bookDirect(input: {
   start: string;
   durationMin: number;
   locus: "in_person" | "remote";
+  requestText?: string;
 }): Promise<string> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
   const start = new Date(input.start);
   const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
-  if (Number.isNaN(start.getTime())) {
-    const offer = await offerTimes(input);
-    return `I couldn't read that time.\n${offer.text}`;
+  const spoken = searchWindow(input.requestText ?? "", new Date());
+  if (Number.isNaN(start.getTime()) || (spoken.named && (start < spoken.earliest || start >= spoken.latest))) {
+    const offer = await offerTimes({ ...input, requested: undefined });
+    return offer.text;
   }
   const end = addMinutes(start, durationMin);
   await refreshCalendars(input.threadId, [person]);
@@ -371,8 +360,10 @@ export async function bookDirect(input: {
       title: input.title,
       durationMin,
       locus: input.locus,
+      requested: start.toISOString(),
+      requestText: input.requestText,
     });
-    return `${optionLabel(start, new Date())} overlaps your calendar, so I left it unbooked.\n${offer.text}`;
+    return offer.text;
   }
 
   await replaceProposed(input.threadId);

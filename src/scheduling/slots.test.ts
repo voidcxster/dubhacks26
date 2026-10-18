@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { buildCandidates, pickSlot, suggestOpenSlots, type Member, type Range } from "./slots.ts";
+import { ymd } from "../time.ts";
+import { buildCandidates, decideOutgoing, pickSlot, resolveSpokenTime, searchWindow, suggestOpenSlots, type Member, type Range } from "./slots.ts";
 
 const now = new Date("2026-10-17T23:00:00.000Z");
 const at = (iso: string) => new Date(iso);
@@ -122,7 +123,7 @@ describe("direct calendar suggestions", () => {
       preferred: [at("2026-10-18T03:00:00Z")],
     });
     expect(plan.slots.map((slot) => slot.label)).not.toContain("Today 8:00 PM");
-    expect(plan.notes.some((note) => note.includes("Today 8:00 PM"))).toBe(true);
+    expect(plan.notes).toContain("Today 8:00 PM conflicts with your Google Calendar until 9:00 PM.");
   });
 
   test("picks a numbered reply or a named time", () => {
@@ -135,5 +136,64 @@ describe("direct calendar suggestions", () => {
     expect(pickSlot("the second one", slots)).toBe(1);
     expect(pickSlot("today at 6", slots)).toBe(0);
     expect(pickSlot("tomorrow at 9", slots)).toBe(2);
+  });
+
+  test("names a chat conflict separately from Google Calendar", () => {
+    const plan = suggestOpenSlots({
+      now,
+      durationMin: 60,
+      locus: "remote",
+      personId: person,
+      ranges: [
+        {
+          personId: person,
+          personName: "Naresh",
+          kind: "busy",
+          source: "booked",
+          start: at("2026-10-18T01:00:00Z"),
+          end: at("2026-10-18T03:00:00Z"),
+        },
+      ],
+      preferred: [at("2026-10-18T01:00:00Z")],
+    });
+    expect(plan.notes).toContain("Today 6:00 PM conflicts with something already planned in this chat until 8:00 PM.");
+  });
+
+  test("reads a spoken time and avoids repeating the same list", () => {
+    expect(resolveSpokenTime("I want to go on 5pm", now)?.toISOString()).toBe("2026-10-18T00:00:00.000Z");
+    const list = "Pick a time for Basketball:\n1. Today 6:00 PM\n2. Today 7:30 PM\nReply with a number.";
+    expect(decideOutgoing({ next: list, previous: list, latestUser: "when am I free?" })).toBeNull();
+    expect(decideOutgoing({ next: list, previous: list, latestUser: "what?" })).toBe(`Here they are again:\n${list}`);
+    const withConflict = `Today 5:00 PM conflicts with your Google Calendar until 6:00 PM.\n${list}`;
+    expect(decideOutgoing({ next: withConflict, previous: list, latestUser: "5pm" })).toBe(
+      "Today 5:00 PM conflicts with your Google Calendar until 6:00 PM.",
+    );
+  });
+
+  test("suggests Wednesday instead of repeating today and tomorrow", () => {
+    const sunday = at("2026-10-18T17:00:00Z");
+    const request = "I want to go to a library on Wednesday. When can I go";
+    const window = searchWindow(request, sunday);
+    expect(ymd(window.earliest)).toBe("2026-10-21");
+    expect(ymd(window.latest)).toBe("2026-10-21");
+    const plan = suggestOpenSlots({
+      now: sunday,
+      durationMin: 60,
+      locus: "in_person",
+      personId: person,
+      ranges: [
+        google("2026-10-19T00:00:00Z", "2026-10-19T01:00:00Z"),
+        google("2026-10-20T00:00:00Z", "2026-10-20T00:50:00Z"),
+      ],
+      preferred: [at("2026-10-19T00:00:00Z"), at("2026-10-20T00:00:00Z")],
+      earliest: window.earliest,
+      latest: window.latest,
+      windowLabel: window.label,
+    });
+    expect(plan.slots.length).toBeGreaterThanOrEqual(3);
+    expect(plan.slots.every((slot) => ymd(slot.start) === "2026-10-21")).toBe(true);
+    expect(plan.notes.join(" ")).not.toMatch(/Today|Tomorrow/);
+    expect(plan.slots[0]?.label.startsWith("Wed")).toBe(true);
+    expect(resolveSpokenTime("Wednesday at 5pm", sunday)?.toISOString()).toBe("2026-10-22T00:00:00.000Z");
   });
 });

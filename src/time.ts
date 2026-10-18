@@ -13,10 +13,43 @@ export function ymd(date: Date, zone = ZONE): string {
   }).format(date);
 }
 
+export function shiftDay(date: Date, days: number, zone = ZONE): string {
+  return shiftYmd(ymd(date, zone), days);
+}
+
 function shiftYmd(day: string, days: number): string {
   const [year, month, date] = day.split("-").map(Number);
   const shifted = new Date(Date.UTC(year!, (month ?? 1) - 1, (date ?? 1) + days));
   return shifted.toISOString().slice(0, 10);
+}
+
+export function weekdayIndex(date: Date, zone = ZONE): number {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone: zone, weekday: "short" }).format(date);
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(name);
+}
+
+export function zonedDate(day: string, hour: number, minute: number, zone = ZONE): Date {
+  const [year, month, date] = day.split("-").map(Number);
+  const target = Date.UTC(year!, (month ?? 1) - 1, date ?? 1, hour, minute);
+  let guess = new Date(target);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(guess);
+    const read = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? "0");
+    const hourPart = read("hour") === 24 ? 0 : read("hour");
+    const shown = Date.UTC(read("year"), read("month") - 1, read("day"), hourPart, read("minute"));
+    const delta = shown - target;
+    if (delta === 0) return guess;
+    guess = new Date(guess.getTime() - delta);
+  }
+  return guess;
 }
 
 export function localParts(date: Date, zone = ZONE): { hour: number; minute: number } {

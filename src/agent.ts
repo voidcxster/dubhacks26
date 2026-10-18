@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { applyAvailability, bookDirect, offerTimes } from "./actions.ts";
 import { activeFacts, addMember, latestProposal, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
 import { env } from "./env.ts";
-import { pickSlot } from "./scheduling/slots.ts";
+import { decideOutgoing, isConfusion, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
 import { clock } from "./time.ts";
 
 const client = new OpenAI({
@@ -95,7 +95,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "reply",
-      description: "The one message to send. After suggest_times, mention each returned time in your own words and include connect_url when it is present. Do not mention polls.",
+      description: "Send one short greeting. Do not use this to list times. suggest_times and book_event already produce the only message the person sees.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -118,6 +118,8 @@ type Turn = {
 
 type Suggestion = { text: string; slots: { label: string; start: string }[] };
 
+const lastSent = new Map<string, string>();
+
 export async function runTurn(input: Turn): Promise<void> {
   if (!input.direct) {
     await input.space.send("Text me one-to-one and I'll suggest times from your calendar. Group chats aren't available on this line.");
@@ -125,6 +127,14 @@ export async function runTurn(input: Turn): Promise<void> {
   }
 
   const phone = input.transcript[0]?.phone ?? "";
+  const latest = input.transcript[0]?.body ?? "";
+  if (phone && isConfusion(latest)) {
+    const previous = lastSent.get(input.threadId);
+    if (previous) {
+      await input.space.send(`Here they are again:\n${previous}`);
+      return;
+    }
+  }
   const chosen = phone ? await bookExistingChoice(input, phone) : null;
   if (chosen) {
     await input.space.send(chosen);
@@ -140,10 +150,11 @@ export async function runTurn(input: Turn): Promise<void> {
       role: "system",
       content: [
         "You schedule for one person in a private iMessage. Never create a poll.",
-        "If they propose a plan and have not chosen a single time, call record_availability for anything they stated, then suggest_times, then reply once.",
-        "The reply must list the suggested times in your own words. Mention calendar conflicts from the tool result. If connect_url is present, include that link in the same message.",
-        "If they choose one suggested time or name one concrete time, call book_event and do not also reply. The booking result is the message.",
-        "Do not offer or book a time that overlaps Google Calendar or an event you already booked.",
+        "If they propose a plan without choosing one listed time, call record_availability for anything they stated, then suggest_times once. Do not call reply.",
+        "Search the day they just asked about. A request for Wednesday or for five days from now must use that day, not today or tomorrow.",
+        "If they choose one suggested time or name one concrete time to book, call book_event and nothing else.",
+        "Never rewrite a list of times. The tool result is the only message they see.",
+        "Do not offer or book a time that overlaps Google Calendar or a plan already made in this chat.",
         "A greeting with no plan gets one short reply.",
         "Remote games such as Overwatch use locus=remote and duration 120. In-person plans such as basketball use locus=in_person and duration 60.",
         `NOW is ${now.toISOString()} (${clock(now)} America/Los_Angeles).`,
@@ -212,15 +223,19 @@ export async function runTurn(input: Turn): Promise<void> {
   }
 
   const outgoing = await chooseOutgoing(input, phone, replyText, bookText, suggestion);
-  if (outgoing) await input.space.send(outgoing);
+  await deliver(input, outgoing);
 }
 
-function mentionsSlots(text: string, labels: string[]): boolean {
-  const hits = labels.filter((label) => {
-    const time = label.replace(/^(Today|Tomorrow)\s+/, "");
-    return text.includes(label) || (time !== label && text.toLowerCase().includes(time.toLowerCase()));
-  });
-  return hits.length >= Math.min(3, labels.length);
+async function deliver(input: Turn, text: string | null): Promise<void> {
+  const latest = input.transcript[0]?.body ?? "";
+  const next = decideOutgoing({ next: text, previous: lastSent.get(input.threadId) ?? null, latestUser: latest });
+  if (!next) {
+    console.log("suppressed repeat");
+    return;
+  }
+  const body = next.replace(/^Here they are again:\n/, "");
+  if (/^\d+\. /m.test(body) || !lastSent.has(input.threadId)) lastSent.set(input.threadId, body);
+  await input.space.send(next);
 }
 
 async function chooseOutgoing(
@@ -230,11 +245,11 @@ async function chooseOutgoing(
   bookText: string | null,
   suggestion: Suggestion | null,
 ): Promise<string | null> {
-  if (bookText) return bookText;
-  if (replyText && !canned.test(replyText) && (!suggestion || suggestion.slots.length === 0 || mentionsSlots(replyText, suggestion.slots.map((slot) => slot.label)))) {
-    return replyText;
-  }
+  if (bookText?.includes("is set for")) return bookText;
+  if (bookText?.includes("conflicts with")) return bookText;
   if (suggestion) return suggestion.text;
+  if (bookText) return bookText;
+  if (replyText && !canned.test(replyText)) return replyText;
   return fallback(input, phone);
 }
 
@@ -272,12 +287,15 @@ async function fallback(input: Turn, phone: string): Promise<string | null> {
     return "I'm here. Tell me what you want to schedule and I'll suggest times that fit your calendar.";
   }
   const plan = guessPlan(latest);
+  const requested = resolveSpokenTime(latest, new Date());
   const offer = await offerTimes({
     threadId: input.threadId,
     phone,
     title: plan.title,
     durationMin: plan.durationMin,
     locus: plan.locus,
+    requested: requested?.toISOString(),
+    requestText: latest,
   });
   return offer.text;
 }
@@ -340,6 +358,7 @@ async function dispatch(
       return "Remembered.";
     }
     if (name === "suggest_times") {
+      const requested = resolveSpokenTime(input.transcript[0]?.body ?? "", new Date());
       const offer = await offerTimes({
         threadId: input.threadId,
         phone: String(args.person_phone ?? phone),
@@ -348,6 +367,8 @@ async function dispatch(
         locus: args.locus === "in_person" ? "in_person" : "remote",
         earliest: args.earliest ? String(args.earliest) : undefined,
         latest: args.latest ? String(args.latest) : undefined,
+        requested: requested?.toISOString(),
+        requestText: input.transcript[0]?.body ?? "",
       });
       sink.setSuggestion(offer);
       return JSON.stringify(offer);
@@ -360,6 +381,7 @@ async function dispatch(
         start: String(args.start ?? ""),
         durationMin: Number(args.duration_minutes ?? 0),
         locus: args.locus === "in_person" ? "in_person" : "remote",
+        requestText: input.transcript[0]?.body ?? "",
       });
       sink.setBook(text);
       return text;
