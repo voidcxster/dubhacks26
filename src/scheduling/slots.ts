@@ -187,6 +187,7 @@ export function suggestOpenSlots(input: {
   earliest?: Date;
   latest?: Date;
   windowLabel?: string;
+  expanded?: boolean;
 }): { slots: SlotOption[]; notes: string[]; windowLabel: string } {
   const zone = input.zone ?? ZONE;
   const bufferMin = input.locus === "in_person" ? 30 : 0;
@@ -223,18 +224,20 @@ export function suggestOpenSlots(input: {
   }
 
   const pool = [...preferred, ...grid];
-  const chosen: Date[] = [];
-  const take = (gapMin: number) => {
-    for (const start of pool) {
-      if (chosen.length >= 3) return;
-      const crowded = chosen.some((have) => Math.abs(have.getTime() - start.getTime()) < gapMin * 60_000);
-      if (crowded) continue;
-      chosen.push(start);
-    }
-  };
-  take(90);
-  if (chosen.length < 3) take(30);
-  chosen.sort((a, b) => a.getTime() - b.getTime());
+  const chosen = spreadChoices(pool, zone);
+  if (chosen.length === 0 && !input.expanded && ymdKey(earliest, zone) === ymdKey(latest, zone)) {
+    const widened = suggestOpenSlots({
+      ...input,
+      earliest: input.now,
+      latest: addMinutes(latest, 4 * 24 * 60),
+      preferred: [],
+      expanded: true,
+      windowLabel: "another day",
+    });
+    notes.add(`${windowLabel} is full, so these are other days.`);
+    for (const note of widened.notes) notes.add(note);
+    return { notes: [...notes], windowLabel, slots: widened.slots };
+  }
 
   const first = chosen[0];
   if (first) {
@@ -305,9 +308,27 @@ export function searchWindow(text: string, now: Date, zone = ZONE): {
   label: string;
   named: boolean;
 } {
-  const inDays = text.match(/\bin\s+(\d+)\s+days?\b/i);
-  const weekday = text.toLowerCase().match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
   const dayAt = (offset: number, hour: number, minute = 0) => zonedDate(shiftDay(now, offset, zone), hour, minute, zone);
+  const inDays = text.match(/\bin\s+(\d+)\s+days?\b/i);
+  const bounded = text.toLowerCase().match(/\b(before|by|until|through)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  const weekday = text.toLowerCase().match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  if (bounded) {
+    const target = weekdays.indexOf(bounded[2] ?? "");
+    const current = weekdayIndex(now, zone);
+    const offset = (target - current + 7) % 7;
+    const includeDay = bounded[1] !== "before";
+    if (!includeDay && offset === 0) {
+      return { earliest: now, latest: dayAt(0, 21), label: "today", named: true };
+    }
+    const latest = includeDay ? dayAt(offset, 21) : dayAt(offset, 9);
+    const name = (bounded[2] ?? "").slice(0, 1).toUpperCase() + (bounded[2] ?? "").slice(1);
+    return {
+      earliest: now,
+      latest,
+      label: includeDay ? `through ${name}` : `before ${name}`,
+      named: true,
+    };
+  }
   if (inDays) {
     const offset = Number(inDays[1]);
     const earliest = dayAt(offset, 9);
@@ -383,6 +404,48 @@ export function resolveSpokenTime(text: string, now: Date, zone = ZONE): Date | 
     cursor = addMinutes(cursor, 30);
   }
   return null;
+}
+
+function nearestAfternoon(starts: Date[], zone: string): Date {
+  const target = 14 * 60;
+  return [...starts].sort((a, b) => {
+    const left = localParts(a, zone);
+    const right = localParts(b, zone);
+    return Math.abs(left.hour * 60 + left.minute - target) - Math.abs(right.hour * 60 + right.minute - target);
+  })[0]!;
+}
+
+function spreadChoices(pool: Date[], zone: string): Date[] {
+  const unique = [...new Map(pool.map((start) => [start.getTime(), start])).values()]
+    .sort((a, b) => a.getTime() - b.getTime());
+  const byDay = new Map<string, Date[]>();
+  for (const start of unique) {
+    const key = ymdKey(start, zone);
+    byDay.set(key, [...(byDay.get(key) ?? []), start]);
+  }
+  const days = [...byDay.keys()];
+  const chosen: Date[] = [];
+  if (days.length >= 2) {
+    const count = Math.min(3, days.length);
+    const picked = new Set<string>();
+    for (let index = 0; index < count; index += 1) {
+      const day = days[Math.round(index * (days.length - 1) / Math.max(count - 1, 1))]!;
+      if (picked.has(day)) continue;
+      picked.add(day);
+      const starts = byDay.get(day);
+      if (starts?.[0]) chosen.push(nearestAfternoon(starts, zone));
+    }
+  }
+  const take = (gapMin: number) => {
+    for (const start of unique) {
+      if (chosen.length >= 3) return;
+      if (chosen.some((have) => Math.abs(have.getTime() - start.getTime()) < gapMin * 60_000)) continue;
+      chosen.push(start);
+    }
+  };
+  take(90);
+  if (chosen.length < 3) take(30);
+  return chosen.sort((a, b) => a.getTime() - b.getTime());
 }
 
 function numberedLines(text: string): string {

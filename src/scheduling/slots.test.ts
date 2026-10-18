@@ -104,8 +104,8 @@ describe("direct calendar suggestions", () => {
     });
     expect(plan.slots.map((slot) => slot.label)).toEqual([
       "Today 6:00 PM",
-      "Today 7:30 PM",
-      "Tomorrow 9:00 AM",
+      "Tomorrow 2:00 PM",
+      "Mon, Oct 19 2:00 PM",
     ]);
     expect(plan.notes).toContain("You're busy until 6:00 PM.");
   });
@@ -203,5 +203,48 @@ describe("direct calendar suggestions", () => {
     expect(isOverride("override")).toBe(true);
     expect(isOverride("2")).toBe(false);
     expect(resolveSpokenTime("Wednesday at 5pm", sunday)?.toISOString()).toBe("2026-10-22T00:00:00.000Z");
+  });
+
+  test("spreads a before-Friday request across the days in between", () => {
+    const sunday = at("2026-10-18T17:00:00Z");
+    const request = "i need to find a book for my research paper at library sometime before Friday";
+    const window = searchWindow(request, sunday);
+    expect(window.label).toBe("before Friday");
+    expect(ymd(window.latest)).toBe("2026-10-23");
+    const plan = suggestOpenSlots({
+      now: sunday,
+      durationMin: 60,
+      locus: "in_person",
+      personId: person,
+      ranges: [google("2026-10-23T20:00:00Z", "2026-10-23T21:20:00Z")],
+      earliest: window.earliest,
+      latest: window.latest,
+      windowLabel: window.label,
+    });
+    const days = new Set(plan.slots.map((slot) => ymd(slot.start)));
+    expect(plan.slots).toHaveLength(3);
+    expect(days.size).toBe(3);
+    expect(plan.slots.every((slot) => ymd(slot.start) < "2026-10-23")).toBe(true);
+  });
+
+  test("offers other days when the requested day is full and keeps the conflict", () => {
+    const sunday = at("2026-10-18T17:00:00Z");
+    const window = searchWindow("I want to go on Wednesday", sunday);
+    const plan = suggestOpenSlots({
+      now: sunday,
+      durationMin: 60,
+      locus: "in_person",
+      personId: person,
+      ranges: [google("2026-10-21T16:00:00Z", "2026-10-22T04:00:00Z")],
+      preferred: [at("2026-10-21T21:00:00Z")],
+      earliest: window.earliest,
+      latest: window.latest,
+      windowLabel: window.label,
+    });
+    expect(plan.slots).toHaveLength(3);
+    expect(plan.slots.every((slot) => ymd(slot.start) !== "2026-10-21")).toBe(true);
+    expect(new Set(plan.slots.map((slot) => ymd(slot.start))).size).toBe(3);
+    expect(plan.notes.some((note) => note.includes("conflicts with your Google Calendar"))).toBe(true);
+    expect(plan.notes.some((note) => note.includes("is full"))).toBe(true);
   });
 });

@@ -153,6 +153,7 @@ export async function runTurn(input: Turn): Promise<void> {
         "You schedule for one person in a private iMessage. Never create a poll.",
         "If they propose a plan without choosing one listed time, call record_availability for anything they stated, then suggest_times once. Do not call reply.",
         "Search the day they just asked about. A request for Wednesday or for five days from now must use that day, not today or tomorrow.",
+        "If they give a range, such as before Friday, spread the three suggestions across different days in that range.",
         "If they choose one suggested time or name one concrete time to book, call book_event and nothing else.",
         "If they reply override, do not call any tool. That replacement is already handled.",
         "Never rewrite a list of times. The tool result is the only message they see.",
