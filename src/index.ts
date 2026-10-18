@@ -1,21 +1,86 @@
-import { Spectrum } from "spectrum-ts";
 import { imessage } from "@spectrum-ts/imessage";
-// Spectrum bridges a single agent loop to many messaging interfaces.
-// Each provider in `providers` adds an interface (terminal TUI, iMessage, …).
-// Docs: https://photon.codes/docs/spectrum-ts
+import { Spectrum } from "spectrum-ts";
+import { bookIfReady, linkMembers, syncMembers } from "./actions.ts";
+import { runTurn } from "./agent.ts";
+import { findOption, insertMessage, migrate, recordVote, recentMessages, upsertPerson, upsertThread } from "./db.ts";
+import { env } from "./env.ts";
+import { startServer } from "./http.ts";
+
+await migrate();
+startServer();
+
 const app = await Spectrum({
-  projectId: process.env.PROJECT_ID!,
-  projectSecret: process.env.PROJECT_SECRET!,
-  providers: [
-    // imessage
-    imessage.config(),
-  ],
+  projectId: env.projectId,
+  projectSecret: env.projectSecret,
+  providers: [imessage.config()],
 });
 
-// `app.messages` is an async iterable. Each tick yields a `space` (the
-// conversation) and an inbound `message`. Reply by awaiting `space.send(...)`.
+const pending = new Map<string, Timer>();
+
+console.log("secretary is listening for iMessage");
+
 for await (const [space, message] of app.messages) {
-  if (message.content.type === "text") {
-    await space.send(`echo: ${message.content.text}`);
+  try {
+    if (message.direction === "outbound") continue;
+    if (message.sender?.kind === "agent") continue;
+
+    if (message.content.type === "poll_option") {
+      const phone = message.sender?.id;
+      if (!phone) continue;
+      const person = await upsertPerson(phone);
+      const match = await findOption({
+        spaceId: space.id,
+        pollGuid: message.content.pollMessageGuid ?? message.content.poll.pollMessageGuid,
+        optionIdentifier: message.content.option.optionIdentifier,
+        label: message.content.option.title,
+      });
+      if (!match) continue;
+      await recordVote(match.planId, match.optionId, person.id, message.content.selected);
+      if (message.content.selected) {
+        await bookIfReady({
+          space: space as Parameters<typeof bookIfReady>[0]["space"],
+          planId: match.planId,
+          immediate: false,
+        });
+      }
+      continue;
+    }
+
+    if (message.content.type !== "text") continue;
+    const phone = message.sender?.id;
+    if (!phone || !message.content.text.trim()) continue;
+
+    console.log("inbound", phone, message.content.text);
+    const thread = await upsertThread(space.id);
+    const people = await syncMembers(space, phone);
+    await linkMembers(thread.id, people);
+    const person = await upsertPerson(phone);
+    await insertMessage({
+      threadId: thread.id,
+      personId: person.id,
+      photonId: message.id,
+      body: message.content.text,
+      sentAt: message.timestamp ?? new Date(),
+    });
+
+    const previous = pending.get(space.id);
+    if (previous) clearTimeout(previous);
+    const current = space;
+    pending.set(space.id, setTimeout(() => {
+      pending.delete(space.id);
+      void current.responding(async () => {
+        const transcript = await recentMessages(thread.id);
+        await runTurn({
+          app,
+          space: current as Parameters<typeof runTurn>[0]["space"],
+          threadId: thread.id,
+          transcript,
+        });
+      }).catch((error: unknown) => {
+        console.error("turn failed", error instanceof Error ? error.message : error);
+      });
+    }, 4_000));
+  } catch (error) {
+    console.error("message failed", error instanceof Error ? error.message : error);
   }
 }

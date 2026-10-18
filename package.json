@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
-    "dev": "bun --watch src/index.ts"
+    "dev": "bun --watch src/index.ts",
+    "test": "bun test"
   },
   "dependencies": {
+    "openai": "^7.38.0",
+    "postgres": "^3.4.9",
     "spectrum-ts": "^12.11.0"
   },
   "devDependencies": {

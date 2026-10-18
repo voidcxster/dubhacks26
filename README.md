@@ -15,11 +15,13 @@ From your project Settings on the [Photon dashboard](https://app.photon.codes):
 
 ```sh
 bun install
-bun start
+bun test
+bun dev
 ```
+
+`bun dev` connects to iMessage, opens the Google OAuth callback on `PUBLIC_BASE_URL`, and answers when a group is picking a time. Ordinary messages get no reply. Poll votes book the option with the most votes after everyone who spoke has voted, or three minutes after the last vote.
 
 ## Where to go next
 
 - [Spectrum docs](https://photon.codes/docs/spectrum-ts)
-- Edit `src/index.ts` to replace the echo loop with real agent logic.
-- Add more providers from `spectrum-ts/providers/*`.
+- Add the agent to a group chat, then text a plan such as "anyone available to hop on overwatch".
