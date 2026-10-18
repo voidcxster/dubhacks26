@@ -19,9 +19,9 @@ bun test
 bun dev
 ```
 
-`bun dev` connects to iMessage, opens the Google OAuth callback on `PUBLIC_BASE_URL`, and answers when a group is picking a time. Ordinary messages get no reply. Poll votes book the option with the most votes after everyone who spoke has voted, or three minutes after the last vote.
+`bun dev` connects to iMessage and opens the Google OAuth callback on `PUBLIC_BASE_URL`. In a one-to-one chat it suggests a few open times from the person's calendar and the conversation, then books the time they pick. The booking message includes a Google Calendar link they can use if the event is not added automatically.
 
 ## Where to go next
 
 - [Spectrum docs](https://photon.codes/docs/spectrum-ts)
-- Add the agent to a group chat, then text a plan such as "anyone available to hop on overwatch".
+- Text the agent directly with a plan such as "I want to play Overwatch tonight".

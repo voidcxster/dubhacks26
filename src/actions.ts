@@ -16,6 +16,7 @@ import {
   rememberBooking,
   rememberFact,
   replaceGoogleBusy,
+  replaceProposed,
   saveEvent,
   selectedVoters,
   threadMembers,
@@ -25,8 +26,8 @@ import {
   type Person,
 } from "./db.ts";
 import { env } from "./env.ts";
-import { addMinutes, clock, dayLabel } from "./time.ts";
-import { buildCandidates, type Member } from "./scheduling/slots.ts";
+import { addMinutes, clock, dayLabel, optionLabel } from "./time.ts";
+import { buildCandidates, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
 
 type ToolSpace = Space & { send: (content: unknown) => Promise<{ content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] } }> };
 
@@ -266,6 +267,171 @@ export async function applyAvailability(input: {
     });
   }
   return `Saved ${input.kind} ${start.toISOString()} to ${end.toISOString()} for ${person.phone}.`;
+}
+
+function suggestionText(input: {
+  title: string;
+  slots: { label: string }[];
+  notes: string[];
+  connectUrl: string | null;
+}): string {
+  if (input.slots.length === 0) {
+    const lines = [
+      `I checked your calendar for ${input.title} and there's no open block long enough through tomorrow evening.`,
+      ...input.notes,
+    ];
+    if (input.connectUrl) lines.push(`Connect Google Calendar so I can see when you're free: ${input.connectUrl}`);
+    return lines.join("\n");
+  }
+  const lines = [
+    `For ${input.title}, these times are open:`,
+    ...input.slots.map((slot, index) => `${index + 1}. ${slot.label}`),
+    ...input.notes,
+    "Reply with one and I'll put it on your calendar.",
+  ];
+  if (input.connectUrl) {
+    lines.push(`Your calendar isn't connected yet, so this misses events I can't see. Connect it: ${input.connectUrl}`);
+  }
+  return lines.join("\n");
+}
+
+export async function offerTimes(input: {
+  threadId: string;
+  phone: string;
+  title: string;
+  durationMin: number;
+  locus: "in_person" | "remote";
+  earliest?: string;
+  latest?: string;
+}): Promise<{ text: string; slots: { label: string; start: string }[] }> {
+  const person = await upsertPerson(input.phone);
+  await addMember(input.threadId, person.id);
+  await refreshCalendars(input.threadId, [person]);
+  const ranges = await loadRanges(input.threadId, [person.id]);
+  const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
+  const earliest = input.earliest ? new Date(input.earliest) : undefined;
+  const latest = input.latest ? new Date(input.latest) : undefined;
+  const built = suggestOpenSlots({
+    now: new Date(),
+    durationMin,
+    locus: input.locus,
+    personId: person.id,
+    ranges,
+    preferred: ranges.filter((range) => range.kind === "free" && range.point).map((range) => range.start),
+    earliest: earliest && !Number.isNaN(earliest.getTime()) ? earliest : undefined,
+    latest: latest && !Number.isNaN(latest.getTime()) ? latest : undefined,
+  });
+  await replaceProposed(input.threadId);
+  if (built.slots.length > 0) {
+    await createPlan({
+      threadId: input.threadId,
+      title: input.title,
+      durationMin,
+      locus: input.locus,
+      options: built.slots,
+    });
+  }
+  const connectUrl = person.google_refresh_token ? null : authUrl(person.id);
+  return {
+    text: suggestionText({ title: input.title, slots: built.slots, notes: built.notes, connectUrl }),
+    slots: built.slots.map((slot) => ({ label: slot.label, start: slot.start.toISOString() })),
+  };
+}
+
+export async function bookDirect(input: {
+  threadId: string;
+  phone: string;
+  title: string;
+  start: string;
+  durationMin: number;
+  locus: "in_person" | "remote";
+}): Promise<string> {
+  const person = await upsertPerson(input.phone);
+  await addMember(input.threadId, person.id);
+  const start = new Date(input.start);
+  const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
+  if (Number.isNaN(start.getTime())) {
+    const offer = await offerTimes(input);
+    return `I couldn't read that time.\n${offer.text}`;
+  }
+  const end = addMinutes(start, durationMin);
+  await refreshCalendars(input.threadId, [person]);
+  const ranges = await loadRanges(input.threadId, [person.id]);
+  const bufferMin = input.locus === "in_person" ? 30 : 0;
+  const conflict = ranges.find((range) => (
+    range.personId === person.id
+    && range.kind === "busy"
+    && start < addMinutes(range.end, bufferMin)
+    && end > range.start
+  ));
+  if (conflict) {
+    const offer = await offerTimes({
+      threadId: input.threadId,
+      phone: input.phone,
+      title: input.title,
+      durationMin,
+      locus: input.locus,
+    });
+    return `${optionLabel(start, new Date())} overlaps your calendar, so I left it unbooked.\n${offer.text}`;
+  }
+
+  await replaceProposed(input.threadId);
+  const planId = await createPlan({
+    threadId: input.threadId,
+    title: input.title,
+    durationMin,
+    locus: input.locus,
+    options: [{ label: optionLabel(start, new Date()), start, end, yes: 1 }],
+  });
+  await markBooked(planId);
+  const template = templateUrl(input.title, start, end);
+  let googleEventId: string | null = null;
+  let htmlLink: string | null = null;
+  if (person.google_refresh_token) {
+    try {
+      const token = await accessToken(person.id, person.google_refresh_token);
+      const created = await insertEvent({
+        token,
+        title: input.title,
+        start,
+        end,
+        attendees: [],
+      });
+      googleEventId = created?.id ?? null;
+      htmlLink = created?.htmlLink ?? null;
+    } catch (error) {
+      console.error("event insert failed", error instanceof Error ? error.message : error);
+    }
+  }
+  await saveEvent({
+    planId,
+    title: input.title,
+    start,
+    end,
+    templateUrl: template,
+    googleEventId,
+    htmlLink,
+    ownerPersonId: person.id,
+  });
+  await rememberBooking({
+    threadId: input.threadId,
+    planId,
+    start,
+    end,
+    personIds: [person.id],
+  });
+  const when = `${dayLabel(start, new Date())} ${clock(start)} – ${clock(end)}`;
+  const lines = [`${input.title} is set for ${when}.`];
+  if (htmlLink) {
+    lines.push(`I added it to your Google Calendar: ${htmlLink}`);
+    lines.push(`If you don't see it, add it yourself: ${template}`);
+  } else {
+    lines.push(`Add it to your calendar: ${template}`);
+  }
+  if (!person.google_refresh_token) {
+    lines.push(`Connect Google Calendar so I can see when you're busy: ${authUrl(person.id)}`);
+  }
+  return lines.join("\n");
 }
 
 export async function connectLink(app: unknown, phone: string, displayName?: string): Promise<string> {

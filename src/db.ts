@@ -464,6 +464,37 @@ export async function winningOption(planId: string): Promise<{
   return row;
 }
 
+export async function replaceProposed(threadId: string): Promise<void> {
+  await sql`
+    update plans set status = 'replaced'
+    where thread_id = ${threadId} and status = 'proposed'
+  `;
+}
+
+export async function latestProposal(threadId: string): Promise<{
+  id: string;
+  title: string;
+  duration_minutes: number;
+  locus: string;
+  options: { id: string; label: string; start_at: Date; end_at: Date }[];
+} | null> {
+  const plan = await openPlan(threadId);
+  if (!plan) return null;
+  const options = await sql<{ id: string; label: string; start_at: Date; end_at: Date }[]>`
+    select id, label, start_at, end_at
+    from plan_options
+    where plan_id = ${plan.id}
+    order by start_at
+  `;
+  return {
+    id: plan.id,
+    title: plan.title,
+    duration_minutes: plan.duration_minutes,
+    locus: plan.locus,
+    options,
+  };
+}
+
 export async function markBooked(planId: string): Promise<boolean> {
   const rows = await sql`
     update plans set status = 'booked'

@@ -74,6 +74,7 @@ for await (const [space, message] of app.messages) {
           app,
           space: current as Parameters<typeof runTurn>[0]["space"],
           threadId: thread.id,
+          direct: current.id.includes(";-;"),
           transcript,
         });
       }).catch((error: unknown) => {

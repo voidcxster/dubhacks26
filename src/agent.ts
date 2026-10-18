@@ -1,7 +1,8 @@
 import OpenAI from "openai";
-import { activeFacts, addMember, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
+import { applyAvailability, bookDirect, offerTimes } from "./actions.ts";
+import { activeFacts, addMember, latestProposal, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
 import { env } from "./env.ts";
-import { applyAvailability, connectLink, propose } from "./actions.ts";
+import { pickSlot } from "./scheduling/slots.ts";
 import { clock } from "./time.ts";
 
 const client = new OpenAI({
@@ -9,12 +10,14 @@ const client = new OpenAI({
   baseURL: "https://api.x.ai/v1",
 });
 
+const canned = /I'll send a poll|right now, in 2 hours, at 8, or tomorrow at 5/i;
+
 const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
       name: "record_availability",
-      description: "Save one absolute availability window for a person in this chat. Resolve relative phrases against NOW before calling. 'Right now', 'in 2 hours', 'at 8', and 'tomorrow at 5' are point=true. If they can start then and did not name a stop, also set open=true and end at 9:00pm local the same day. 'From 4' is point=false, open=true, start at 4:00pm, end at 9:00pm. A reason like chem homework is kind=busy for only that interval, plus a separate free window for when they can start.",
+      description: "Save one absolute availability window the person stated. Resolve relative phrases against NOW. A named start is point=true. 'From 4' is point=false and open=true. Homework or another conflict is kind=busy.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -36,7 +39,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "remember_fact",
-      description: "Store a short fact. Ephemeral facts expire. Durable facts are the activity itself, not one-off homework.",
+      description: "Store a short fact. Ephemeral facts expire. Durable facts are the activity itself.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -54,8 +57,45 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "suggest_times",
+      description: "Look at this person's calendar and the chat, then return 3 to 6 open times. Does not message them. Call this when they propose a plan and have not chosen one time yet.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          duration_minutes: { type: "number" },
+          locus: { type: "string", enum: ["in_person", "remote"] },
+          earliest: { type: "string", description: "Optional ISO start of the search window" },
+          latest: { type: "string", description: "Optional ISO end of the search window" },
+        },
+        required: ["title", "duration_minutes", "locus"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "book_event",
+      description: "Book one concrete time that does not overlap their calendar. Adds the Google Calendar event when they are connected, and always returns a manual add link. Call this when they pick a suggested time or name one time.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          start: { type: "string", description: "ISO 8601 timestamp" },
+          duration_minutes: { type: "number" },
+          locus: { type: "string", enum: ["in_person", "remote"] },
+        },
+        required: ["title", "start", "duration_minutes", "locus"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "reply",
-      description: "Send one short message into the chat. Use this to greet, or to ask when people can make a plan before a poll exists.",
+      description: "The one message to send. After suggest_times, mention each returned time in your own words and include connect_url when it is present. Do not mention polls.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -66,47 +106,31 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
       },
     },
   },
-  {
-    type: "function",
-    function: {
-      name: "send_poll",
-      description: "Build poll times from recorded availability and connected calendars, then send one iMessage poll. Call this once after availability is saved. Do not invent the option text.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          title: { type: "string" },
-          duration_minutes: { type: "number" },
-          locus: { type: "string", enum: ["in_person", "remote"] },
-        },
-        required: ["title", "duration_minutes", "locus"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "send_calendar_link",
-      description: "DM one person a Google Calendar connect link.",
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          person_phone: { type: "string" },
-          display_name: { type: "string" },
-        },
-        required: ["person_phone"],
-      },
-    },
-  },
 ];
 
-export async function runTurn(input: {
+type Turn = {
   app: unknown;
-  space: Parameters<typeof propose>[0]["space"];
+  space: { send: (body: string) => Promise<unknown> };
   threadId: string;
+  direct: boolean;
   transcript: { phone: string | null; body: string; sent_at: Date }[];
-}): Promise<void> {
+};
+
+type Suggestion = { text: string; slots: { label: string; start: string }[] };
+
+export async function runTurn(input: Turn): Promise<void> {
+  if (!input.direct) {
+    await input.space.send("Text me one-to-one and I'll suggest times from your calendar. Group chats aren't available on this line.");
+    return;
+  }
+
+  const phone = input.transcript[0]?.phone ?? "";
+  const chosen = phone ? await bookExistingChoice(input, phone) : null;
+  if (chosen) {
+    await input.space.send(chosen);
+    return;
+  }
+
   const people = await threadMembers(input.threadId);
   const facts = await activeFacts(input.threadId);
   const ranges = await loadRanges(input.threadId, people.map((person) => person.id));
@@ -115,13 +139,13 @@ export async function runTurn(input: {
     {
       role: "system",
       content: [
-        "You schedule plans inside an iMessage group.",
-        "If someone proposes an activity and people have already named times, record every availability window, then call send_poll once.",
-        "If someone proposes an activity and there are not yet two concrete times, call reply and ask the group when they can make it.",
-        "A greeting with no plan gets a one-line reply that says you can schedule.",
-        "Do not ask who is organizing.",
-        "Remote games such as Overwatch use locus=remote and duration 120 when nobody names one. In-person plans such as basketball use locus=in_person and duration 60.",
-        "A connected calendar belongs to a person even if they have not replied. Record only what was said; send_poll applies calendars.",
+        "You schedule for one person in a private iMessage. Never create a poll.",
+        "If they propose a plan and have not chosen a single time, call record_availability for anything they stated, then suggest_times, then reply once.",
+        "The reply must list the suggested times in your own words. Mention calendar conflicts from the tool result. If connect_url is present, include that link in the same message.",
+        "If they choose one suggested time or name one concrete time, call book_event and do not also reply. The booking result is the message.",
+        "Do not offer or book a time that overlaps Google Calendar or an event you already booked.",
+        "A greeting with no plan gets one short reply.",
+        "Remote games such as Overwatch use locus=remote and duration 120. In-person plans such as basketball use locus=in_person and duration 60.",
         `NOW is ${now.toISOString()} (${clock(now)} America/Los_Angeles).`,
         `People: ${people.map(describe).join("; ") || "none yet"}`,
         `Facts: ${JSON.stringify(facts)}`,
@@ -131,8 +155,6 @@ export async function runTurn(input: {
           source: range.source,
           start: range.start.toISOString(),
           end: range.end.toISOString(),
-          point: range.point,
-          open: range.open,
         })))}`,
       ].join("\n"),
     },
@@ -146,44 +168,131 @@ export async function runTurn(input: {
     },
   ];
 
-  let spoke = false;
-  for (let step = 0; step < 6; step += 1) {
-    const completion = await client.chat.completions.create({
-      model: env.xaiModel,
-      messages,
-      tools,
-      tool_choice: "auto",
-    });
-    const message = completion.choices[0]?.message;
-    if (!message) break;
-    const calls = message.tool_calls ?? [];
-    if (calls.length === 0) break;
-    messages.push(message);
-    for (const call of calls) {
-      if (call.type !== "function") continue;
-      const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-      console.log("tool", call.function.name);
-      const result = await dispatch(input, args, call.function.name);
-      if (call.function.name === "reply" || call.function.name === "send_poll") spoke = true;
-      messages.push({ role: "tool", tool_call_id: call.id, content: result });
+  let replyText: string | null = null;
+  let bookText: string | null = null;
+  let suggestion: Suggestion | null = null;
+
+  try {
+    for (let step = 0; step < 6; step += 1) {
+      const completion = await client.chat.completions.create({
+        model: env.xaiModel,
+        messages,
+        tools,
+        tool_choice: "auto",
+      });
+      const message = completion.choices[0]?.message;
+      if (!message) break;
+      const calls = message.tool_calls ?? [];
+      if (calls.length === 0) {
+        const written = message.content?.trim();
+        if (written && !canned.test(written)) replyText = written;
+        break;
+      }
+      messages.push(message);
+      for (const call of calls) {
+        if (call.type !== "function") continue;
+        const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
+        console.log("tool", call.function.name);
+        const result = await dispatch(input, phone, args, call.function.name, {
+          setReply: (text) => {
+            replyText = text;
+          },
+          setBook: (text) => {
+            bookText = text;
+          },
+          setSuggestion: (value) => {
+            suggestion = value;
+          },
+        });
+        messages.push({ role: "tool", tool_call_id: call.id, content: result });
+      }
     }
+  } catch (error) {
+    console.error("model failed", error instanceof Error ? error.message : error);
   }
-  if (!spoke) await fallbackReply(input.space, input.transcript);
+
+  const outgoing = await chooseOutgoing(input, phone, replyText, bookText, suggestion);
+  if (outgoing) await input.space.send(outgoing);
 }
 
-async function fallbackReply(
-  space: Parameters<typeof propose>[0]["space"],
-  transcript: { body: string }[],
-): Promise<void> {
-  const text = transcript.map((line) => line.body).join("\n");
-  if (/overwatch|hop on|available|basketball|tonight|tomorrow|free at|meet/i.test(text)) {
-    await space.send("I'm in. Reply with when you can — right now, in 2 hours, at 8, or tomorrow at 5 — and I'll send a poll.");
-    return;
+function mentionsSlots(text: string, labels: string[]): boolean {
+  const hits = labels.filter((label) => {
+    const time = label.replace(/^(Today|Tomorrow)\s+/, "");
+    return text.includes(label) || (time !== label && text.toLowerCase().includes(time.toLowerCase()));
+  });
+  return hits.length >= Math.min(3, labels.length);
+}
+
+async function chooseOutgoing(
+  input: Turn,
+  phone: string,
+  replyText: string | null,
+  bookText: string | null,
+  suggestion: Suggestion | null,
+): Promise<string | null> {
+  if (bookText) return bookText;
+  if (replyText && !canned.test(replyText) && (!suggestion || suggestion.slots.length === 0 || mentionsSlots(replyText, suggestion.slots.map((slot) => slot.label)))) {
+    return replyText;
   }
-  const latest = transcript[0]?.body ?? "";
-  if (/^\s*hi\b/i.test(latest)) {
-    await space.send("I'm here. Name a plan, like Overwatch tonight, and I'll turn the replies into a poll.");
+  if (suggestion) return suggestion.text;
+  return fallback(input, phone);
+}
+
+async function bookExistingChoice(input: Turn, phone: string): Promise<string | null> {
+  const latest = input.transcript[0]?.body?.trim() ?? "";
+  if (!isChoice(latest)) return null;
+  const proposal = await latestProposal(input.threadId);
+  if (!proposal) return null;
+  const index = pickSlot(latest, proposal.options.map((option) => ({
+    label: option.label,
+    start: new Date(option.start_at),
+  })));
+  const chosen = index === null ? null : proposal.options[index];
+  if (!chosen) return null;
+  return bookDirect({
+    threadId: input.threadId,
+    phone,
+    title: proposal.title,
+    start: new Date(chosen.start_at).toISOString(),
+    durationMin: proposal.duration_minutes,
+    locus: proposal.locus === "in_person" ? "in_person" : "remote",
+  });
+}
+
+function isChoice(text: string): boolean {
+  return /^\s*(?:option\s*)?[1-6]\s*$/i.test(text)
+    || /^\s*(?:the\s+)?(?:first|second|third|fourth|fifth|sixth)(?:\s+one)?\s*$/i.test(text)
+    || /^\s*(?:today|tonight|tomorrow)?\s*(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*$/i.test(text);
+}
+
+async function fallback(input: Turn, phone: string): Promise<string | null> {
+  const latest = input.transcript[0]?.body?.trim() ?? "";
+  if (!phone || !latest) return null;
+  if (/^\s*(hi|hey|hello)\b[.!]*\s*$/i.test(latest)) {
+    return "I'm here. Tell me what you want to schedule and I'll suggest times that fit your calendar.";
   }
+  const plan = guessPlan(latest);
+  const offer = await offerTimes({
+    threadId: input.threadId,
+    phone,
+    title: plan.title,
+    durationMin: plan.durationMin,
+    locus: plan.locus,
+  });
+  return offer.text;
+}
+
+function guessPlan(text: string): { title: string; durationMin: number; locus: "in_person" | "remote" } {
+  const inPerson = /basketball|dinner|lunch|coffee|meet|in person/i.test(text);
+  let title = "Plan";
+  if (/overwatch/i.test(text)) title = "Overwatch";
+  else if (/basketball/i.test(text)) title = "Basketball";
+  else title = text.replace(/^(can we|i want to|i wanna|let's|lets|anyone want to)\s+/i, "").replace(/\s+/g, " ").trim().slice(0, 60) || "Plan";
+  return {
+    title,
+    durationMin: /overwatch|valorant|game|hop on/i.test(text) ? 120 : 60,
+    locus: inPerson ? "in_person" : "remote",
+  };
 }
 
 function describe(person: Person): string {
@@ -192,15 +301,21 @@ function describe(person: Person): string {
 }
 
 async function dispatch(
-  input: { app: unknown; space: Parameters<typeof propose>[0]["space"]; threadId: string },
+  input: Turn,
+  phone: string,
   args: Record<string, unknown>,
   name: string,
+  sink: {
+    setReply: (text: string) => void;
+    setBook: (text: string) => void;
+    setSuggestion: (value: Suggestion) => void;
+  },
 ): Promise<string> {
   try {
     if (name === "record_availability") {
       return await applyAvailability({
         threadId: input.threadId,
-        phone: String(args.person_phone ?? ""),
+        phone: String(args.person_phone ?? phone),
         displayName: args.display_name ? String(args.display_name) : undefined,
         kind: args.kind === "busy" ? "busy" : "free",
         start: String(args.start ?? ""),
@@ -211,8 +326,8 @@ async function dispatch(
       });
     }
     if (name === "remember_fact") {
-      const phone = args.person_phone ? String(args.person_phone) : "";
-      const person = phone ? await upsertPerson(phone) : null;
+      const owner = String(args.person_phone ?? phone);
+      const person = owner ? await upsertPerson(owner) : null;
       if (person) await addMember(input.threadId, person.id);
       await rememberFact({
         threadId: input.threadId,
@@ -224,28 +339,36 @@ async function dispatch(
       });
       return "Remembered.";
     }
-    if (name === "reply") {
-      const text = String(args.text ?? "").trim();
-      if (!text) return "Empty reply.";
-      await input.space.send(text);
-      return "Sent.";
-    }
-    if (name === "send_poll") {
-      const result = await propose({
-        app: input.app,
-        space: input.space,
+    if (name === "suggest_times") {
+      const offer = await offerTimes({
         threadId: input.threadId,
+        phone: String(args.person_phone ?? phone),
         title: String(args.title ?? "Plan"),
         durationMin: Number(args.duration_minutes ?? 0),
         locus: args.locus === "in_person" ? "in_person" : "remote",
+        earliest: args.earliest ? String(args.earliest) : undefined,
+        latest: args.latest ? String(args.latest) : undefined,
       });
-      if (!result.startsWith("Poll sent")) {
-        await input.space.send("I'm in. Reply with when you can — right now, in 2 hours, at 8, or tomorrow at 5 — and I'll send a poll.");
-      }
-      return result;
+      sink.setSuggestion(offer);
+      return JSON.stringify(offer);
     }
-    if (name === "send_calendar_link") {
-      return await connectLink(input.app, String(args.person_phone ?? ""), args.display_name ? String(args.display_name) : undefined);
+    if (name === "book_event") {
+      const text = await bookDirect({
+        threadId: input.threadId,
+        phone,
+        title: String(args.title ?? "Plan"),
+        start: String(args.start ?? ""),
+        durationMin: Number(args.duration_minutes ?? 0),
+        locus: args.locus === "in_person" ? "in_person" : "remote",
+      });
+      sink.setBook(text);
+      return text;
+    }
+    if (name === "reply") {
+      const text = String(args.text ?? "").trim();
+      if (!text || canned.test(text)) return "That reply was dropped. Use the suggested times instead.";
+      sink.setReply(text);
+      return "Queued.";
     }
     return `Unknown tool ${name}`;
   } catch (error) {

@@ -19,6 +19,18 @@ function shiftYmd(day: string, days: number): string {
   return shifted.toISOString().slice(0, 10);
 }
 
+export function localParts(date: Date, zone = ZONE): { hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    hourCycle: "h23",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(date);
+  const read = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? "0");
+  const hour = read("hour");
+  return { hour: hour === 24 ? 0 : hour, minute: read("minute") };
+}
+
 export function clock(date: Date, zone = ZONE): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: zone,
