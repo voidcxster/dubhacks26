@@ -241,6 +241,26 @@ export async function recordWindow(input: {
   `;
 }
 
+export async function googleBackedEvents(personId: string): Promise<{ plan_id: string; google_event_id: string }[]> {
+  return sql<{ plan_id: string; google_event_id: string }[]>`
+    select plan_id, google_event_id
+    from events
+    where owner_person_id = ${personId}
+      and google_event_id is not null
+      and end_at > now() - interval '1 day'
+  `;
+}
+
+export async function forgetBooking(planId: string): Promise<void> {
+  await sql`delete from windows where plan_id = ${planId} and source = 'booked'`;
+  await sql`
+    delete from facts
+    where kind = 'booking'
+      and payload->>'planId' = ${planId}
+  `;
+  await sql`update events set google_event_id = null where plan_id = ${planId}`;
+}
+
 export async function replaceGoogleBusy(personId: string, threadId: string, blocks: { start: Date; end: Date }[]): Promise<void> {
   await sql`delete from windows where person_id = ${personId} and source = 'google'`;
   for (const block of blocks) {

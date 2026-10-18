@@ -1,8 +1,8 @@
 import OpenAI from "openai";
-import { applyAvailability, bookDirect, offerTimes } from "./actions.ts";
+import { applyAvailability, bookDirect, offerTimes, syncCalendars } from "./actions.ts";
 import { activeFacts, addMember, latestProposal, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
 import { env } from "./env.ts";
-import { decideOutgoing, isConfusion, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
+import { decideOutgoing, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
 import { clock } from "./time.ts";
 
 const client = new OpenAI({
@@ -127,13 +127,9 @@ export async function runTurn(input: Turn): Promise<void> {
   }
 
   const phone = input.transcript[0]?.phone ?? "";
-  const latest = input.transcript[0]?.body ?? "";
-  if (phone && isConfusion(latest)) {
-    const previous = lastSent.get(input.threadId);
-    if (previous) {
-      await input.space.send(`Here they are again:\n${previous}`);
-      return;
-    }
+  if (phone) {
+    const person = await upsertPerson(phone);
+    await syncCalendars(input.threadId, [person]);
   }
   const chosen = phone ? await bookExistingChoice(input, phone) : null;
   if (chosen) {
@@ -154,7 +150,7 @@ export async function runTurn(input: Turn): Promise<void> {
         "Search the day they just asked about. A request for Wednesday or for five days from now must use that day, not today or tomorrow.",
         "If they choose one suggested time or name one concrete time to book, call book_event and nothing else.",
         "Never rewrite a list of times. The tool result is the only message they see.",
-        "Do not offer or book a time that overlaps Google Calendar or a plan already made in this chat.",
+        "Google Calendar was just refreshed. A deleted event is free. Do not call a time busy unless it is in Windows.",
         "A greeting with no plan gets one short reply.",
         "Remote games such as Overwatch use locus=remote and duration 120. In-person plans such as basketball use locus=in_person and duration 60.",
         `NOW is ${now.toISOString()} (${clock(now)} America/Los_Angeles).`,

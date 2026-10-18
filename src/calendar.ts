@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { env, oauthRedirectUri } from "./env.ts";
-import { googleUtc, icsStamp } from "./time.ts";
+import { googleUtc, icsStamp, zonedDate } from "./time.ts";
 
 const scopes = [
   "https://www.googleapis.com/auth/calendar.freebusy",
@@ -89,7 +89,63 @@ export async function primaryEmail(token: string): Promise<string | null> {
   return json.id ?? null;
 }
 
-export async function freeBusy(token: string, start: Date, end: Date): Promise<{ start: Date; end: Date }[]> {
+export type GoogleEvent = {
+  status?: string;
+  transparency?: string;
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
+};
+
+export function busyBlocksFromEvents(items: GoogleEvent[]): { start: Date; end: Date }[] {
+  const blocks: { start: Date; end: Date }[] = [];
+  for (const item of items) {
+    if (item.status === "cancelled" || item.transparency === "transparent") continue;
+    if (item.start?.dateTime && item.end?.dateTime) {
+      blocks.push({ start: new Date(item.start.dateTime), end: new Date(item.end.dateTime) });
+      continue;
+    }
+    if (item.start?.date && item.end?.date) {
+      blocks.push({ start: zonedDate(item.start.date, 0, 0), end: zonedDate(item.end.date, 0, 0) });
+    }
+  }
+  return blocks.filter((block) => block.end > block.start);
+}
+
+export async function listBusy(token: string, start: Date, end: Date): Promise<{ start: Date; end: Date }[] | null> {
+  const items: GoogleEvent[] = [];
+  let pageToken = "";
+  for (let page = 0; page < 5; page += 1) {
+    const params = new URLSearchParams({
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: "true",
+      orderBy: "startTime",
+      maxResults: "250",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) return null;
+    const json = await response.json() as { items?: GoogleEvent[]; nextPageToken?: string };
+    items.push(...json.items ?? []);
+    pageToken = json.nextPageToken ?? "";
+    if (!pageToken) break;
+  }
+  return busyBlocksFromEvents(items);
+}
+
+export async function googleEventStatus(token: string, eventId: string): Promise<"active" | "gone" | "unknown"> {
+  const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (response.status === 404 || response.status === 410) return "gone";
+  if (!response.ok) return "unknown";
+  const json = await response.json() as { status?: string };
+  return json.status === "cancelled" ? "gone" : "active";
+}
+
+export async function freeBusy(token: string, start: Date, end: Date): Promise<{ start: Date; end: Date }[] | null> {
   const response = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
     method: "POST",
     headers: {
@@ -102,7 +158,7 @@ export async function freeBusy(token: string, start: Date, end: Date): Promise<{
       items: [{ id: "primary" }],
     }),
   });
-  if (!response.ok) return [];
+  if (!response.ok) return null;
   const json = await response.json() as {
     calendars?: { primary?: { busy?: { start: string; end: string }[] } };
   };

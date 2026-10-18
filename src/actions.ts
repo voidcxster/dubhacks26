@@ -1,7 +1,7 @@
 import { imessage } from "@spectrum-ts/imessage";
 import { poll } from "spectrum-ts";
 import type { Space } from "spectrum-ts";
-import { accessToken, authUrl, freeBusy, insertEvent, templateUrl } from "./calendar.ts";
+import { accessToken, authUrl, googleEventStatus, insertEvent, listBusy, templateUrl } from "./calendar.ts";
 import {
   addMember,
   attachPoll,
@@ -10,6 +10,8 @@ import {
   getPlan,
   loadRanges,
   markBooked,
+  forgetBooking,
+  googleBackedEvents,
   openPlan,
   recentSpeakerIds,
   recordWindow,
@@ -54,17 +56,22 @@ export async function linkMembers(threadId: string, people: Person[]): Promise<v
   for (const person of people) await addMember(threadId, person.id);
 }
 
-async function refreshCalendars(threadId: string, people: Person[]): Promise<void> {
+export async function syncCalendars(threadId: string, people: Person[]): Promise<void> {
   const start = new Date();
   const end = addMinutes(start, 14 * 24 * 60);
   for (const person of people) {
     if (!person.google_refresh_token) continue;
     try {
       const token = await accessToken(person.id, person.google_refresh_token);
-      const blocks = await freeBusy(token, start, end);
-      await replaceGoogleBusy(person.id, threadId, blocks);
+      const blocks = await listBusy(token, start, end);
+      if (blocks) await replaceGoogleBusy(person.id, threadId, blocks);
+      const backed = await googleBackedEvents(person.id);
+      for (const event of backed) {
+        const status = await googleEventStatus(token, event.google_event_id);
+        if (status === "gone") await forgetBooking(event.plan_id);
+      }
     } catch (error) {
-      console.error("freebusy failed", person.phone, error instanceof Error ? error.message : error);
+      console.error("calendar sync failed", person.phone, error instanceof Error ? error.message : error);
     }
   }
 }
@@ -97,7 +104,7 @@ export async function propose(input: {
   if (existing) return `A poll is already open for ${existing.title}.`;
 
   const people = await threadMembers(input.threadId);
-  await refreshCalendars(input.threadId, people);
+  await syncCalendars(input.threadId, people);
   const ranges = await loadRanges(input.threadId, people.map((person) => person.id));
   const members: Member[] = people.map((person) => ({
     id: person.id,
@@ -283,7 +290,7 @@ export async function offerTimes(input: {
 }): Promise<{ text: string; slots: { label: string; start: string }[] }> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
-  await refreshCalendars(input.threadId, [person]);
+  await syncCalendars(input.threadId, [person]);
   const ranges = await loadRanges(input.threadId, [person.id]);
   const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
   const now = new Date();
@@ -344,7 +351,7 @@ export async function bookDirect(input: {
     return offer.text;
   }
   const end = addMinutes(start, durationMin);
-  await refreshCalendars(input.threadId, [person]);
+  await syncCalendars(input.threadId, [person]);
   const ranges = await loadRanges(input.threadId, [person.id]);
   const bufferMin = input.locus === "in_person" ? 30 : 0;
   const conflict = ranges.find((range) => (
