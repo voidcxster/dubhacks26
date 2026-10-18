@@ -19,7 +19,7 @@ bun test
 bun dev
 ```
 
-`bun dev` connects to iMessage and opens the Google OAuth callback on `PUBLIC_BASE_URL`. In a one-to-one chat it suggests a few open times from the person's calendar and the conversation, then books the time they pick. The booking message includes a Google Calendar link they can use if the event is not added automatically.
+`bun dev` connects to iMessage and opens the Google OAuth callback on `PUBLIC_BASE_URL`. In a one-to-one chat it sends an iMessage poll with three open times from the person's calendar and the conversation. When a requested time conflicts, the poll also includes Override, which replaces the existing event. Tapping a choice books it. The booking message includes a Google Calendar link they can use if the event is not added automatically.
 
 ## Where to go next
 

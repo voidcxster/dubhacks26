@@ -8,11 +8,13 @@ import {
   createPlan,
   getPerson,
   getPlan,
+  getPlanOption,
   loadRanges,
   markBooked,
   forgetBooking,
   forgetOverlappingBusy,
   googleBackedEvents,
+  latestProposal,
   openPlan,
   recentSpeakerIds,
   recordWindow,
@@ -30,9 +32,20 @@ import {
 } from "./db.ts";
 import { env } from "./env.ts";
 import { addMinutes, clock, dayLabel, optionLabel } from "./time.ts";
-import { buildCandidates, formatOffer, isOverride, searchWindow, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
+import { buildCandidates, formatOffer, isOverride, pollChoices, pollPreface, searchWindow, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
 
 type ToolSpace = Space & { send: (content: unknown) => Promise<{ content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] } }> };
+
+export type Offer = {
+  text: string;
+  preface: string | null;
+  slots: { label: string; start: string }[];
+  poll: { planId: string; title: string; labels: string[] } | null;
+};
+
+type Sendable = { send: (body: unknown) => Promise<unknown> };
+
+const bookingPlans = new Set<string>();
 
 const settleTimers = new Map<string, Timer>();
 
@@ -298,7 +311,7 @@ export async function offerTimes(input: {
   latest?: string;
   requested?: string;
   requestText?: string;
-}): Promise<{ text: string; slots: { label: string; start: string }[] }> {
+}): Promise<Offer> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
   await syncCalendars(input.threadId, [person]);
@@ -326,16 +339,6 @@ export async function offerTimes(input: {
     latest,
     windowLabel: spoken.label,
   });
-  await replaceProposed(input.threadId);
-  if (built.slots.length > 0) {
-    await createPlan({
-      threadId: input.threadId,
-      title: input.title,
-      durationMin,
-      locus: input.locus,
-      options: built.slots,
-    });
-  }
   const connectUrl = person.google_refresh_token ? null : authUrl(person.id);
   const canOverride = Boolean(requested && !Number.isNaN(requested.getTime()) && built.notes.some((note) => note.includes("conflicts with")));
   const overrideWhen = canOverride && requested ? optionLabel(requested, now) : null;
@@ -350,6 +353,27 @@ export async function offerTimes(input: {
   } else {
     pendingOverrides.delete(input.threadId);
   }
+  const options = built.slots.map((slot) => ({ label: slot.label, start: slot.start, end: slot.end, yes: 0 }));
+  if (overrideWhen && requested) {
+    options.push({
+      label: "Override",
+      start: requested,
+      end: addMinutes(requested, durationMin),
+      yes: 0,
+    });
+  }
+  await replaceProposed(input.threadId);
+  const planId = options.length > 0
+    ? await createPlan({
+      threadId: input.threadId,
+      title: input.title,
+      durationMin,
+      locus: input.locus,
+      options,
+    })
+    : null;
+  const labels = pollChoices(built.slots, overrideWhen);
+  const preface = pollPreface({ notes: built.notes, connectUrl, overrideWhen });
   return {
     text: formatOffer({
       title: input.title,
@@ -359,7 +383,11 @@ export async function offerTimes(input: {
       windowLabel: built.windowLabel,
       overrideWhen,
     }),
+    preface,
     slots: built.slots.map((slot) => ({ label: slot.label, start: slot.start.toISOString() })),
+    poll: planId && labels.length > 0
+      ? { planId, title: `Pick a time for ${input.title}`, labels }
+      : null,
   };
 }
 
@@ -372,15 +400,14 @@ export async function bookDirect(input: {
   locus: "in_person" | "remote";
   requestText?: string;
   ignoreConflict?: boolean;
-}): Promise<string> {
+}): Promise<string | Offer> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
   const start = new Date(input.start);
   const durationMin = input.durationMin > 0 ? input.durationMin : input.locus === "remote" ? 120 : 60;
   const spoken = searchWindow(input.requestText ?? "", new Date());
   if (Number.isNaN(start.getTime()) || (spoken.named && (start < spoken.earliest || start >= spoken.latest))) {
-    const offer = await offerTimes({ ...input, requested: undefined });
-    return offer.text;
+    return offerTimes({ ...input, requested: undefined });
   }
   const end = addMinutes(start, durationMin);
   await syncCalendars(input.threadId, [person]);
@@ -393,7 +420,7 @@ export async function bookDirect(input: {
     && end > range.start
   ));
   if (conflict) {
-    const offer = await offerTimes({
+    return offerTimes({
       threadId: input.threadId,
       phone: input.phone,
       title: input.title,
@@ -402,7 +429,6 @@ export async function bookDirect(input: {
       requested: start.toISOString(),
       requestText: input.requestText,
     });
-    return offer.text;
   }
 
   await replaceProposed(input.threadId);
@@ -464,8 +490,24 @@ export async function bookDirect(input: {
   return lines.join("\n");
 }
 
-export async function applyOverride(threadId: string): Promise<string> {
-  const pending = pendingOverrides.get(threadId);
+async function pendingFromPlan(threadId: string, phone?: string): Promise<PendingOverride | null> {
+  const proposal = await latestProposal(threadId);
+  const option = proposal?.options.find((item) => item.label === "Override");
+  if (!proposal || !option) return null;
+  const members = phone ? [] : await threadMembers(threadId);
+  const owner = phone || members[0]?.phone;
+  if (!owner) return null;
+  return {
+    phone: owner,
+    title: proposal.title,
+    start: new Date(option.start_at),
+    durationMin: proposal.duration_minutes,
+    locus: proposal.locus === "in_person" ? "in_person" : "remote",
+  };
+}
+
+export async function applyOverride(threadId: string, phone?: string): Promise<string> {
+  const pending = pendingOverrides.get(threadId) ?? await pendingFromPlan(threadId, phone);
   if (!pending) return "I don't have a conflicting time to replace. Tell me which time you want.";
   pendingOverrides.delete(threadId);
   const person = await upsertPerson(pending.phone);
@@ -474,14 +516,18 @@ export async function applyOverride(threadId: string): Promise<string> {
     try {
       const token = await accessToken(person.id, person.google_refresh_token);
       const removed = await deleteOverlappingEvents(token, pending.start, end);
-      if (!removed) return "I couldn't delete the old Google Calendar event, so I left your schedule as it is.";
+      if (!removed) {
+        pendingOverrides.set(threadId, pending);
+        return "I couldn't delete the old Google Calendar event, so I left your schedule as it is.";
+      }
     } catch (error) {
       console.error("override delete failed", error instanceof Error ? error.message : error);
+      pendingOverrides.set(threadId, pending);
       return "I couldn't delete the old Google Calendar event, so I left your schedule as it is.";
     }
   }
   await forgetOverlappingBusy(person.id, pending.start, end);
-  return bookDirect({
+  const booked = await bookDirect({
     threadId,
     phone: pending.phone,
     title: pending.title,
@@ -490,6 +536,70 @@ export async function applyOverride(threadId: string): Promise<string> {
     locus: pending.locus,
     ignoreConflict: true,
   });
+  return typeof booked === "string" ? booked : booked.text;
+}
+
+export async function publishPoll(space: Sendable, offer: Offer): Promise<void> {
+  if (!offer.poll) {
+    if (offer.text) await space.send(offer.text);
+    return;
+  }
+  if (offer.preface) await space.send(offer.preface);
+  try {
+    const sent = await space.send(poll(offer.poll.title, offer.poll.labels)) as {
+      content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] };
+    };
+    if (sent?.content?.type === "poll") {
+      await attachPoll(offer.poll.planId, sent.content.pollMessageGuid, sent.content.options ?? []);
+    } else {
+      console.log("poll sent without option identifiers", sent?.content?.type);
+    }
+  } catch (error) {
+    console.error("poll send failed", error instanceof Error ? error.message : error);
+    await space.send(offer.text);
+  }
+}
+
+export async function bookPollChoice(input: {
+  space: Sendable;
+  planId: string;
+  optionId: string;
+  phone: string;
+}): Promise<void> {
+  if (bookingPlans.has(input.planId)) return;
+  const option = await getPlanOption(input.optionId);
+  const plan = await getPlan(input.planId);
+  if (!option || !plan || plan.status !== "proposed") return;
+  bookingPlans.add(input.planId);
+  const locus = plan.locus === "in_person" ? "in_person" : "remote";
+  try {
+    if (option.label === "Override") {
+      pendingOverrides.set(plan.thread_id, {
+        phone: input.phone,
+        title: plan.title,
+        start: new Date(option.start_at),
+        durationMin: plan.duration_minutes,
+        locus,
+      });
+      const text = await applyOverride(plan.thread_id);
+      if (text.startsWith("I couldn't delete") || text.startsWith("I don't have")) bookingPlans.delete(input.planId);
+      await input.space.send(text);
+      return;
+    }
+    const result = await bookDirect({
+      threadId: plan.thread_id,
+      phone: input.phone,
+      title: plan.title,
+      start: new Date(option.start_at).toISOString(),
+      durationMin: plan.duration_minutes,
+      locus,
+    });
+    if (typeof result === "string") await input.space.send(result);
+    else await publishPoll(input.space, result);
+  } catch (error) {
+    bookingPlans.delete(input.planId);
+    throw error;
+  }
 }
 
 export { isOverride };

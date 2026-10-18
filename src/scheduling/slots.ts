@@ -358,6 +358,25 @@ export function searchWindow(text: string, now: Date, zone = ZONE): {
   return { earliest: now, latest: addMinutes(now, 48 * 60), label: "through tomorrow evening", named: false };
 }
 
+export function pollChoices(slots: { label: string }[], overrideWhen?: string | null): string[] {
+  const labels = slots.slice(0, 3).map((slot) => slot.label);
+  if (overrideWhen) labels.push("Override");
+  return labels;
+}
+
+export function pollPreface(input: {
+  notes: string[];
+  connectUrl: string | null;
+  overrideWhen?: string | null;
+}): string | null {
+  const conflicts = input.notes.filter((note) => note.includes("conflicts with"));
+  const other = input.notes.filter((note) => !note.includes("conflicts with"));
+  const lines = [...conflicts, ...other];
+  if (input.overrideWhen) lines.push(`Override replaces the existing event at ${input.overrideWhen}.`);
+  if (input.connectUrl) lines.push(`Connect Google Calendar to include the rest of your schedule: ${input.connectUrl}`);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
 export function formatOffer(input: {
   title: string;
   slots: { label: string }[];
@@ -385,6 +404,40 @@ export function formatOffer(input: {
   lines.push(...other);
   if (input.connectUrl) lines.push(`Connect Google Calendar to include the rest of your schedule: ${input.connectUrl}`);
   return lines.join("\n");
+}
+
+export function fixedEvent(text: string, now: Date, zone = ZONE): {
+  title: string;
+  start: Date;
+  durationMin: number;
+  locus: "in_person" | "remote";
+} | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (/\b(?:when|what time|which time|suggest|options|sometime|whenever|available)\b/i.test(trimmed)) return null;
+  if (/\b(?:i(?:'m| am)\s+(?:free|busy|available|out)|i can(?:not|'?t)|i cannot|not free)\b/i.test(trimmed)) return null;
+  if (/^\s*(?:today|tonight|tomorrow|on\s+\w+day)?\s*(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*[.!]?\s*$/i.test(trimmed)) return null;
+  const start = resolveSpokenTime(trimmed, now, zone);
+  if (!start) return null;
+  const inPerson = /basketball|dinner|lunch|coffee|meet|in person/i.test(trimmed);
+  let title = trimmed
+    .replace(/^(?:i have to|i need to|i gotta|i(?:'ve| have) got to|i must|i should|i(?:'m| am) going to|going to|gonna|let's|lets|i want to|i wanna|can we|anyone want to|i have|i(?:'ve| have) got)\s+/i, "")
+    .replace(/\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/ig, "")
+    .replace(/\b(?:tonight|today|tomorrow|this evening|in the morning|in the afternoon|in the evening)\b/ig, "")
+    .replace(/\b(?:on\s+)?(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/ig, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,.-]+|[\s,.-]+$/g, "")
+    .trim();
+  if (/overwatch/i.test(trimmed)) title = "Overwatch";
+  else if (/basketball/i.test(trimmed)) title = "Basketball";
+  else if (title) title = title.charAt(0).toUpperCase() + title.slice(1);
+  else title = "Plan";
+  return {
+    title: title.slice(0, 60),
+    start,
+    durationMin: /overwatch|valorant|game|hop on/i.test(trimmed) ? 120 : 60,
+    locus: inPerson ? "in_person" : "remote",
+  };
 }
 
 export function resolveSpokenTime(text: string, now: Date, zone = ZONE): Date | null {

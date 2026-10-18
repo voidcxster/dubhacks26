@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ymd } from "../time.ts";
-import { buildCandidates, decideOutgoing, formatOffer, isOverride, pickSlot, resolveSpokenTime, searchWindow, suggestOpenSlots, type Member, type Range } from "./slots.ts";
+import { buildCandidates, decideOutgoing, fixedEvent, formatOffer, isOverride, pickSlot, pollChoices, pollPreface, resolveSpokenTime, searchWindow, suggestOpenSlots, type Member, type Range } from "./slots.ts";
 
 const now = new Date("2026-10-17T23:00:00.000Z");
 const at = (iso: string) => new Date(iso);
@@ -158,6 +158,14 @@ describe("direct calendar suggestions", () => {
 
   test("reads a spoken time and avoids repeating the same list", () => {
     expect(resolveSpokenTime("I want to go on 5pm", now)?.toISOString()).toBe("2026-10-18T00:00:00.000Z");
+    const sundayMorning = at("2026-10-18T17:00:00Z");
+    const teeth = fixedEvent("I have to brush my teeth at 10pm", sundayMorning);
+    expect(teeth?.title).toBe("Brush my teeth");
+    expect(teeth?.start.toISOString()).toBe("2026-10-19T05:00:00.000Z");
+    expect(teeth?.durationMin).toBe(60);
+    expect(fixedEvent("when can I brush my teeth at 10pm", sundayMorning)).toBeNull();
+    expect(fixedEvent("I'm free at 10pm", sundayMorning)).toBeNull();
+    expect(fixedEvent("let's play overwatch at 8pm", sundayMorning)?.title).toBe("Overwatch");
     const list = "Pick a time for Basketball:\n1. Today 6:00 PM\n2. Today 7:30 PM\nReply with a number.";
     expect(decideOutgoing({ next: list, previous: list, latestUser: "when am I free?" })).toBeNull();
     expect(decideOutgoing({ next: list, previous: list, latestUser: "what?" })).toBe(`Here they are again:\n${list}`);
@@ -200,6 +208,15 @@ describe("direct calendar suggestions", () => {
       overrideWhen: "Wed, Oct 21 5:00 PM",
     });
     expect(offer).toContain('reply "override" to replace the existing event and book Library visit at Wed, Oct 21 5:00 PM.');
+    expect(pollChoices(plan.slots, "Wed, Oct 21 5:00 PM")).toEqual([
+      ...plan.slots.map((slot) => slot.label),
+      "Override",
+    ]);
+    expect(pollPreface({
+      notes: ["Wed, Oct 21 5:00 PM conflicts with your Google Calendar until 6:00 PM."],
+      connectUrl: null,
+      overrideWhen: "Wed, Oct 21 5:00 PM",
+    })).toContain("Override replaces the existing event at Wed, Oct 21 5:00 PM.");
     expect(isOverride("override")).toBe(true);
     expect(isOverride("2")).toBe(false);
     expect(resolveSpokenTime("Wednesday at 5pm", sunday)?.toISOString()).toBe("2026-10-22T00:00:00.000Z");

@@ -1,8 +1,8 @@
 import OpenAI from "openai";
-import { applyAvailability, applyOverride, bookDirect, isOverride, offerTimes, syncCalendars } from "./actions.ts";
+import { applyAvailability, applyOverride, bookDirect, isOverride, offerTimes, publishPoll, syncCalendars, type Offer } from "./actions.ts";
 import { activeFacts, addMember, latestProposal, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
 import { env } from "./env.ts";
-import { decideOutgoing, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
+import { decideOutgoing, fixedEvent, isConfusion, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
 import { clock } from "./time.ts";
 
 const client = new OpenAI({
@@ -58,7 +58,7 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "suggest_times",
-      description: "Look at this person's calendar and the chat, then return 3 to 6 open times. Does not message them. Call this when they propose a plan and have not chosen one time yet.",
+      description: "Look at this person's calendar and the chat, then return 3 open times. Those times are sent as an iMessage poll. Call this when they propose a plan and have not chosen one time yet.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -110,13 +110,13 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
 
 type Turn = {
   app: unknown;
-  space: { send: (body: string) => Promise<unknown> };
+  space: { send: (body: unknown) => Promise<unknown> };
   threadId: string;
   direct: boolean;
   transcript: { phone: string | null; body: string; sent_at: Date }[];
 };
 
-type Suggestion = { text: string; slots: { label: string; start: string }[] };
+type Suggestion = Offer;
 
 const lastSent = new Map<string, string>();
 
@@ -133,12 +133,25 @@ export async function runTurn(input: Turn): Promise<void> {
     await syncCalendars(input.threadId, [person]);
   }
   if (phone && isOverride(latest)) {
-    await input.space.send(await applyOverride(input.threadId));
+    await input.space.send(await applyOverride(input.threadId, phone));
     return;
   }
   const chosen = phone ? await bookExistingChoice(input, phone) : null;
   if (chosen) {
-    await input.space.send(chosen);
+    await present(input, chosen);
+    return;
+  }
+  const stated = phone ? fixedEvent(latest, new Date()) : null;
+  if (stated) {
+    await present(input, await bookDirect({
+      threadId: input.threadId,
+      phone,
+      title: stated.title,
+      start: stated.start.toISOString(),
+      durationMin: stated.durationMin,
+      locus: stated.locus,
+      requestText: latest,
+    }));
     return;
   }
 
@@ -150,12 +163,12 @@ export async function runTurn(input: Turn): Promise<void> {
     {
       role: "system",
       content: [
-        "You schedule for one person in a private iMessage. Never create a poll.",
+        "You schedule for one person in a private iMessage. suggest_times is delivered as an iMessage poll. Do not write the times yourself.",
         "If they propose a plan without choosing one listed time, call record_availability for anything they stated, then suggest_times once. Do not call reply.",
         "Search the day they just asked about. A request for Wednesday or for five days from now must use that day, not today or tomorrow.",
         "If they give a range, such as before Friday, spread the three suggestions across different days in that range.",
-        "If they choose one suggested time or name one concrete time to book, call book_event and nothing else.",
-        "If they reply override, do not call any tool. That replacement is already handled.",
+        "If they choose one suggested time, or state an activity at one concrete time such as 'I have to brush my teeth at 10pm', call book_event and nothing else. Do not reply that it is noted or blocked.",
+        "If they reply override, a number, or tap a poll choice, do not call any tool. That booking is already handled.",
         "Never rewrite a list of times. The tool result is the only message they see.",
         "Google Calendar was just refreshed. A deleted event is free. Do not call a time busy unless it is in Windows.",
         "A greeting with no plan gets one short reply.",
@@ -226,7 +239,24 @@ export async function runTurn(input: Turn): Promise<void> {
   }
 
   const outgoing = await chooseOutgoing(input, phone, replyText, bookText, suggestion);
-  await deliver(input, outgoing);
+  await present(input, outgoing);
+}
+
+async function present(input: Turn, result: string | Offer | null): Promise<void> {
+  if (!result) return;
+  if (typeof result !== "string" && result.poll) {
+    const key = `poll:${result.poll.labels.join("|")}`;
+    const latest = input.transcript[0]?.body ?? "";
+    if (lastSent.get(input.threadId) === key && !isConfusion(latest)) {
+      console.log("suppressed repeat");
+      return;
+    }
+    await publishPoll(input.space, result);
+    lastSent.set(input.threadId, key);
+    return;
+  }
+  const text = typeof result === "string" ? result : result.text;
+  await deliver(input, text);
 }
 
 async function deliver(input: Turn, text: string | null): Promise<void> {
@@ -247,16 +277,17 @@ async function chooseOutgoing(
   replyText: string | null,
   bookText: string | null,
   suggestion: Suggestion | null,
-): Promise<string | null> {
+): Promise<string | Offer | null> {
   if (bookText?.includes("is set for")) return bookText;
+  if (suggestion?.poll) return suggestion;
   if (bookText?.includes("conflicts with")) return bookText;
-  if (suggestion) return suggestion.text;
+  if (suggestion) return suggestion;
   if (bookText) return bookText;
   if (replyText && !canned.test(replyText)) return replyText;
   return fallback(input, phone);
 }
 
-async function bookExistingChoice(input: Turn, phone: string): Promise<string | null> {
+async function bookExistingChoice(input: Turn, phone: string): Promise<string | Offer | null> {
   const latest = input.transcript[0]?.body?.trim() ?? "";
   if (!isChoice(latest)) return null;
   const proposal = await latestProposal(input.threadId);
@@ -267,6 +298,9 @@ async function bookExistingChoice(input: Turn, phone: string): Promise<string | 
   })));
   const chosen = index === null ? null : proposal.options[index];
   if (!chosen) return null;
+  if (chosen.label === "Override") {
+    return applyOverride(input.threadId, phone);
+  }
   return bookDirect({
     threadId: input.threadId,
     phone,
@@ -283,7 +317,7 @@ function isChoice(text: string): boolean {
     || /^\s*(?:today|tonight|tomorrow)?\s*(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*$/i.test(text);
 }
 
-async function fallback(input: Turn, phone: string): Promise<string | null> {
+async function fallback(input: Turn, phone: string): Promise<string | Offer | null> {
   const latest = input.transcript[0]?.body?.trim() ?? "";
   if (!phone || !latest) return null;
   if (/^\s*(hi|hey|hello)\b[.!]*\s*$/i.test(latest)) {
@@ -300,7 +334,7 @@ async function fallback(input: Turn, phone: string): Promise<string | null> {
     requested: requested?.toISOString(),
     requestText: latest,
   });
-  return offer.text;
+  return offer;
 }
 
 function guessPlan(text: string): { title: string; durationMin: number; locus: "in_person" | "remote" } {
@@ -377,7 +411,7 @@ async function dispatch(
       return JSON.stringify(offer);
     }
     if (name === "book_event") {
-      const text = await bookDirect({
+      const result = await bookDirect({
         threadId: input.threadId,
         phone,
         title: String(args.title ?? "Plan"),
@@ -386,8 +420,12 @@ async function dispatch(
         locus: args.locus === "in_person" ? "in_person" : "remote",
         requestText: input.transcript[0]?.body ?? "",
       });
-      sink.setBook(text);
-      return text;
+      if (typeof result === "string") {
+        sink.setBook(result);
+        return result;
+      }
+      sink.setSuggestion(result);
+      return result.text;
     }
     if (name === "reply") {
       const text = String(args.text ?? "").trim();

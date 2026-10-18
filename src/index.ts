@@ -1,6 +1,6 @@
 import { imessage } from "@spectrum-ts/imessage";
 import { Spectrum } from "spectrum-ts";
-import { bookIfReady, linkMembers, syncMembers } from "./actions.ts";
+import { bookPollChoice, linkMembers, syncMembers } from "./actions.ts";
 import { runTurn } from "./agent.ts";
 import { findOption, insertMessage, migrate, recordVote, recentMessages, upsertPerson, upsertThread } from "./db.ts";
 import { env } from "./env.ts";
@@ -37,10 +37,11 @@ for await (const [space, message] of app.messages) {
       if (!match) continue;
       await recordVote(match.planId, match.optionId, person.id, message.content.selected);
       if (message.content.selected) {
-        await bookIfReady({
-          space: space as Parameters<typeof bookIfReady>[0]["space"],
+        await bookPollChoice({
+          space: space as Parameters<typeof bookPollChoice>[0]["space"],
           planId: match.planId,
-          immediate: false,
+          optionId: match.optionId,
+          phone,
         });
       }
       continue;

@@ -411,6 +411,27 @@ export async function createPlan(input: {
   return plan.id;
 }
 
+export async function getPlanOption(optionId: string): Promise<{
+  id: string;
+  plan_id: string;
+  label: string;
+  start_at: Date;
+  end_at: Date;
+} | null> {
+  const [row] = await sql<{
+    id: string;
+    plan_id: string;
+    label: string;
+    start_at: Date;
+    end_at: Date;
+  }[]>`
+    select id, plan_id, label, start_at, end_at
+    from plan_options
+    where id = ${optionId}
+  `;
+  return row ?? null;
+}
+
 export async function attachPoll(planId: string, guid: string | undefined, options: { title: string; optionIdentifier?: string }[]): Promise<void> {
   if (guid) {
     await sql`update plans set poll_message_guid = ${guid} where id = ${planId}`;
@@ -524,7 +545,7 @@ export async function latestProposal(threadId: string): Promise<{
     select id, label, start_at, end_at
     from plan_options
     where plan_id = ${plan.id}
-    order by start_at
+    order by case when label = 'Override' then 1 else 0 end, start_at
   `;
   return {
     id: plan.id,
