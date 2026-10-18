@@ -90,6 +90,7 @@ export async function primaryEmail(token: string): Promise<string | null> {
 }
 
 export type GoogleEvent = {
+  id?: string;
   status?: string;
   transparency?: string;
   start?: { dateTime?: string; date?: string };
@@ -111,7 +112,17 @@ export function busyBlocksFromEvents(items: GoogleEvent[]): { start: Date; end: 
   return blocks.filter((block) => block.end > block.start);
 }
 
-export async function listBusy(token: string, start: Date, end: Date): Promise<{ start: Date; end: Date }[] | null> {
+export function overlappingEventIds(items: GoogleEvent[], start: Date, end: Date): string[] {
+  const ids: string[] = [];
+  for (const item of items) {
+    if (!item.id) continue;
+    const block = busyBlocksFromEvents([item])[0];
+    if (block && start < block.end && end > block.start) ids.push(item.id);
+  }
+  return ids;
+}
+
+async function listCalendarEvents(token: string, start: Date, end: Date): Promise<GoogleEvent[] | null> {
   const items: GoogleEvent[] = [];
   let pageToken = "";
   for (let page = 0; page < 5; page += 1) {
@@ -132,7 +143,29 @@ export async function listBusy(token: string, start: Date, end: Date): Promise<{
     pageToken = json.nextPageToken ?? "";
     if (!pageToken) break;
   }
-  return busyBlocksFromEvents(items);
+  return items;
+}
+
+export async function listBusy(token: string, start: Date, end: Date): Promise<{ start: Date; end: Date }[] | null> {
+  const items = await listCalendarEvents(token, start, end);
+  return items ? busyBlocksFromEvents(items) : null;
+}
+
+export async function deleteEvent(token: string, eventId: string): Promise<boolean> {
+  const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  return response.ok || response.status === 404 || response.status === 410;
+}
+
+export async function deleteOverlappingEvents(token: string, start: Date, end: Date): Promise<boolean> {
+  const items = await listCalendarEvents(token, start, end);
+  if (!items) return false;
+  for (const id of overlappingEventIds(items, start, end)) {
+    if (!await deleteEvent(token, id)) return false;
+  }
+  return true;
 }
 
 export async function googleEventStatus(token: string, eventId: string): Promise<"active" | "gone" | "unknown"> {

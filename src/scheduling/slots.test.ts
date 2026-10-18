@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ymd } from "../time.ts";
-import { buildCandidates, decideOutgoing, pickSlot, resolveSpokenTime, searchWindow, suggestOpenSlots, type Member, type Range } from "./slots.ts";
+import { buildCandidates, decideOutgoing, formatOffer, isOverride, pickSlot, resolveSpokenTime, searchWindow, suggestOpenSlots, type Member, type Range } from "./slots.ts";
 
 const now = new Date("2026-10-17T23:00:00.000Z");
 const at = (iso: string) => new Date(iso);
@@ -106,9 +106,6 @@ describe("direct calendar suggestions", () => {
       "Today 6:00 PM",
       "Today 7:30 PM",
       "Tomorrow 9:00 AM",
-      "Tomorrow 10:30 AM",
-      "Tomorrow 12:00 PM",
-      "Tomorrow 1:30 PM",
     ]);
     expect(plan.notes).toContain("You're busy until 6:00 PM.");
   });
@@ -193,7 +190,18 @@ describe("direct calendar suggestions", () => {
     expect(plan.slots.length).toBeGreaterThanOrEqual(3);
     expect(plan.slots.every((slot) => ymd(slot.start) === "2026-10-21")).toBe(true);
     expect(plan.notes.join(" ")).not.toMatch(/Today|Tomorrow/);
+    expect(plan.slots).toHaveLength(3);
     expect(plan.slots[0]?.label.startsWith("Wed")).toBe(true);
+    const offer = formatOffer({
+      title: "Library visit",
+      slots: plan.slots,
+      notes: ["Wed, Oct 21 5:00 PM conflicts with your Google Calendar until 6:00 PM."],
+      connectUrl: null,
+      overrideWhen: "Wed, Oct 21 5:00 PM",
+    });
+    expect(offer).toContain('reply "override" to replace the existing event and book Library visit at Wed, Oct 21 5:00 PM.');
+    expect(isOverride("override")).toBe(true);
+    expect(isOverride("2")).toBe(false);
     expect(resolveSpokenTime("Wednesday at 5pm", sunday)?.toISOString()).toBe("2026-10-22T00:00:00.000Z");
   });
 });

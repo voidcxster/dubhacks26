@@ -1,7 +1,7 @@
 import { imessage } from "@spectrum-ts/imessage";
 import { poll } from "spectrum-ts";
 import type { Space } from "spectrum-ts";
-import { accessToken, authUrl, googleEventStatus, insertEvent, listBusy, templateUrl } from "./calendar.ts";
+import { accessToken, authUrl, deleteOverlappingEvents, googleEventStatus, insertEvent, listBusy, templateUrl } from "./calendar.ts";
 import {
   addMember,
   attachPoll,
@@ -11,6 +11,7 @@ import {
   loadRanges,
   markBooked,
   forgetBooking,
+  forgetOverlappingBusy,
   googleBackedEvents,
   openPlan,
   recentSpeakerIds,
@@ -29,11 +30,21 @@ import {
 } from "./db.ts";
 import { env } from "./env.ts";
 import { addMinutes, clock, dayLabel, optionLabel } from "./time.ts";
-import { buildCandidates, formatOffer, searchWindow, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
+import { buildCandidates, formatOffer, isOverride, searchWindow, suggestOpenSlots, type Member } from "./scheduling/slots.ts";
 
 type ToolSpace = Space & { send: (content: unknown) => Promise<{ content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] } }> };
 
 const settleTimers = new Map<string, Timer>();
+
+type PendingOverride = {
+  phone: string;
+  title: string;
+  start: Date;
+  durationMin: number;
+  locus: "in_person" | "remote";
+};
+
+const pendingOverrides = new Map<string, PendingOverride>();
 
 export async function syncMembers(space: Space, senderPhone?: string): Promise<Person[]> {
   const phones = new Set<string>();
@@ -326,8 +337,28 @@ export async function offerTimes(input: {
     });
   }
   const connectUrl = person.google_refresh_token ? null : authUrl(person.id);
+  const canOverride = Boolean(requested && !Number.isNaN(requested.getTime()) && built.notes.some((note) => note.includes("conflicts with")));
+  const overrideWhen = canOverride && requested ? optionLabel(requested, now) : null;
+  if (overrideWhen && requested) {
+    pendingOverrides.set(input.threadId, {
+      phone: input.phone,
+      title: input.title,
+      start: requested,
+      durationMin,
+      locus: input.locus,
+    });
+  } else {
+    pendingOverrides.delete(input.threadId);
+  }
   return {
-    text: formatOffer({ title: input.title, slots: built.slots, notes: built.notes, connectUrl, windowLabel: built.windowLabel }),
+    text: formatOffer({
+      title: input.title,
+      slots: built.slots,
+      notes: built.notes,
+      connectUrl,
+      windowLabel: built.windowLabel,
+      overrideWhen,
+    }),
     slots: built.slots.map((slot) => ({ label: slot.label, start: slot.start.toISOString() })),
   };
 }
@@ -340,6 +371,7 @@ export async function bookDirect(input: {
   durationMin: number;
   locus: "in_person" | "remote";
   requestText?: string;
+  ignoreConflict?: boolean;
 }): Promise<string> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
@@ -354,7 +386,7 @@ export async function bookDirect(input: {
   await syncCalendars(input.threadId, [person]);
   const ranges = await loadRanges(input.threadId, [person.id]);
   const bufferMin = input.locus === "in_person" ? 30 : 0;
-  const conflict = ranges.find((range) => (
+  const conflict = input.ignoreConflict ? undefined : ranges.find((range) => (
     range.personId === person.id
     && range.kind === "busy"
     && start < addMinutes(range.end, bufferMin)
@@ -431,6 +463,36 @@ export async function bookDirect(input: {
   }
   return lines.join("\n");
 }
+
+export async function applyOverride(threadId: string): Promise<string> {
+  const pending = pendingOverrides.get(threadId);
+  if (!pending) return "I don't have a conflicting time to replace. Tell me which time you want.";
+  pendingOverrides.delete(threadId);
+  const person = await upsertPerson(pending.phone);
+  const end = addMinutes(pending.start, pending.durationMin);
+  if (person.google_refresh_token) {
+    try {
+      const token = await accessToken(person.id, person.google_refresh_token);
+      const removed = await deleteOverlappingEvents(token, pending.start, end);
+      if (!removed) return "I couldn't delete the old Google Calendar event, so I left your schedule as it is.";
+    } catch (error) {
+      console.error("override delete failed", error instanceof Error ? error.message : error);
+      return "I couldn't delete the old Google Calendar event, so I left your schedule as it is.";
+    }
+  }
+  await forgetOverlappingBusy(person.id, pending.start, end);
+  return bookDirect({
+    threadId,
+    phone: pending.phone,
+    title: pending.title,
+    start: pending.start.toISOString(),
+    durationMin: pending.durationMin,
+    locus: pending.locus,
+    ignoreConflict: true,
+  });
+}
+
+export { isOverride };
 
 export async function connectLink(app: unknown, phone: string, displayName?: string): Promise<string> {
   const person = await upsertPerson(phone, displayName);

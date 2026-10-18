@@ -251,6 +251,26 @@ export async function googleBackedEvents(personId: string): Promise<{ plan_id: s
   `;
 }
 
+export async function forgetOverlappingBusy(personId: string, start: Date, end: Date): Promise<void> {
+  const plans = await sql<{ plan_id: string | null }[]>`
+    select distinct plan_id
+    from windows
+    where person_id = ${personId}
+      and source = 'booked'
+      and plan_id is not null
+      and during && tstzrange(${start}, ${end}, '[)')
+  `;
+  for (const plan of plans) {
+    if (plan.plan_id) await forgetBooking(plan.plan_id);
+  }
+  await sql`
+    delete from windows
+    where person_id = ${personId}
+      and kind = 'busy'
+      and during && tstzrange(${start}, ${end}, '[)')
+  `;
+}
+
 export async function forgetBooking(planId: string): Promise<void> {
   await sql`delete from windows where plan_id = ${planId} and source = 'booked'`;
   await sql`

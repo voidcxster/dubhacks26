@@ -226,7 +226,7 @@ export function suggestOpenSlots(input: {
   const chosen: Date[] = [];
   const take = (gapMin: number) => {
     for (const start of pool) {
-      if (chosen.length >= 6) return;
+      if (chosen.length >= 3) return;
       const crowded = chosen.some((have) => Math.abs(have.getTime() - start.getTime()) < gapMin * 60_000);
       if (crowded) continue;
       chosen.push(start);
@@ -343,6 +343,7 @@ export function formatOffer(input: {
   notes: string[];
   connectUrl: string | null;
   windowLabel?: string;
+  overrideWhen?: string | null;
 }): string {
   const conflicts = input.notes.filter((note) => note.includes("conflicts with"));
   const other = input.notes.filter((note) => !note.includes("conflicts with"));
@@ -354,6 +355,10 @@ export function formatOffer(input: {
   } else {
     lines.push(`Pick a time for ${input.title}:`);
     lines.push(...input.slots.map((slot, index) => `${index + 1}. ${slot.label}`));
+  }
+  if (input.overrideWhen) {
+    lines.push(`Reply with a number, or reply "override" to replace the existing event and book ${input.title} at ${input.overrideWhen}.`);
+  } else if (input.slots.length > 0) {
     lines.push("Reply with a number.");
   }
   lines.push(...other);
@@ -382,6 +387,10 @@ export function resolveSpokenTime(text: string, now: Date, zone = ZONE): Date | 
 
 function numberedLines(text: string): string {
   return [...text.matchAll(/^\d+\. .+$/gm)].map((match) => match[0]).join("\n");
+}
+
+export function isOverride(text: string): boolean {
+  return /^(?:override|replace(?:\s+it)?|yes,?\s+replace|delete the old(?: one)?)\b[.!]*$/i.test(text.trim());
 }
 
 export function isConfusion(text: string): boolean {

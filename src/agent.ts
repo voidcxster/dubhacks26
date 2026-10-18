@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { applyAvailability, bookDirect, offerTimes, syncCalendars } from "./actions.ts";
+import { applyAvailability, applyOverride, bookDirect, isOverride, offerTimes, syncCalendars } from "./actions.ts";
 import { activeFacts, addMember, latestProposal, loadRanges, rememberFact, threadMembers, upsertPerson, type Person } from "./db.ts";
 import { env } from "./env.ts";
 import { decideOutgoing, pickSlot, resolveSpokenTime } from "./scheduling/slots.ts";
@@ -127,9 +127,14 @@ export async function runTurn(input: Turn): Promise<void> {
   }
 
   const phone = input.transcript[0]?.phone ?? "";
+  const latest = input.transcript[0]?.body ?? "";
   if (phone) {
     const person = await upsertPerson(phone);
     await syncCalendars(input.threadId, [person]);
+  }
+  if (phone && isOverride(latest)) {
+    await input.space.send(await applyOverride(input.threadId));
+    return;
   }
   const chosen = phone ? await bookExistingChoice(input, phone) : null;
   if (chosen) {
@@ -149,6 +154,7 @@ export async function runTurn(input: Turn): Promise<void> {
         "If they propose a plan without choosing one listed time, call record_availability for anything they stated, then suggest_times once. Do not call reply.",
         "Search the day they just asked about. A request for Wednesday or for five days from now must use that day, not today or tomorrow.",
         "If they choose one suggested time or name one concrete time to book, call book_event and nothing else.",
+        "If they reply override, do not call any tool. That replacement is already handled.",
         "Never rewrite a list of times. The tool result is the only message they see.",
         "Google Calendar was just refreshed. A deleted event is free. Do not call a time busy unless it is in Windows.",
         "A greeting with no plan gets one short reply.",
