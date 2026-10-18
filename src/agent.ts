@@ -143,7 +143,7 @@ export async function runTurn(input: Turn): Promise<void> {
   }
   const stated = phone ? fixedEvent(latest, new Date()) : null;
   if (stated) {
-    await present(input, await bookDirect({
+    await present(input, bookedMessage(await bookDirect({
       threadId: input.threadId,
       phone,
       title: stated.title,
@@ -151,7 +151,7 @@ export async function runTurn(input: Turn): Promise<void> {
       durationMin: stated.durationMin,
       locus: stated.locus,
       requestText: latest,
-    }));
+    })));
     return;
   }
 
@@ -301,14 +301,19 @@ async function bookExistingChoice(input: Turn, phone: string): Promise<string | 
   if (chosen.label === "Override") {
     return applyOverride(input.threadId, phone);
   }
-  return bookDirect({
+  return bookedMessage(await bookDirect({
     threadId: input.threadId,
     phone,
     title: proposal.title,
     start: new Date(chosen.start_at).toISOString(),
     durationMin: proposal.duration_minutes,
     locus: proposal.locus === "in_person" ? "in_person" : "remote",
-  });
+  }));
+}
+
+function bookedMessage(result: string | Offer | { stale: true }): string | Offer | null {
+  if (typeof result !== "string" && "stale" in result) return null;
+  return result;
 }
 
 function isChoice(text: string): boolean {
@@ -424,6 +429,7 @@ async function dispatch(
         sink.setBook(result);
         return result;
       }
+      if ("stale" in result) return "Superseded.";
       sink.setSuggestion(result);
       return result.text;
     }

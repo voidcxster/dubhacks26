@@ -271,6 +271,10 @@ export async function forgetOverlappingBusy(personId: string, start: Date, end: 
   `;
 }
 
+export async function retirePlan(planId: string): Promise<void> {
+  await sql`update plans set status = 'replaced' where id = ${planId}`;
+}
+
 export async function forgetBooking(planId: string): Promise<void> {
   await sql`delete from windows where plan_id = ${planId} and source = 'booked'`;
   await sql`
@@ -458,12 +462,12 @@ export async function findOption(input: {
     join plans p on p.id = o.plan_id
     join threads t on t.id = p.thread_id
     where t.photon_space_id = ${input.spaceId}
-      and p.status = 'proposed'
       and (
         (${input.optionIdentifier ?? null}::text is not null and o.option_identifier = ${input.optionIdentifier ?? null})
         or o.label = ${input.label}
         or (${input.pollGuid ?? null}::text is not null and p.poll_message_guid = ${input.pollGuid ?? null} and o.label = ${input.label})
       )
+    order by p.created_at desc
     limit 1
   `;
   return row ? { planId: row.plan_id, optionId: row.option_id, threadId: row.thread_id } : null;

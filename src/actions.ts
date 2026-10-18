@@ -1,7 +1,7 @@
 import { imessage } from "@spectrum-ts/imessage";
 import { poll } from "spectrum-ts";
 import type { Space } from "spectrum-ts";
-import { accessToken, authUrl, deleteOverlappingEvents, googleEventStatus, insertEvent, listBusy, templateUrl } from "./calendar.ts";
+import { accessToken, authUrl, deleteEvent, deleteOverlappingEvents, googleEventStatus, insertEvent, listBusy, templateUrl } from "./calendar.ts";
 import {
   addMember,
   attachPoll,
@@ -12,6 +12,7 @@ import {
   loadRanges,
   markBooked,
   forgetBooking,
+  retirePlan,
   forgetOverlappingBusy,
   googleBackedEvents,
   latestProposal,
@@ -45,7 +46,13 @@ export type Offer = {
 
 type Sendable = { send: (body: unknown) => Promise<unknown> };
 
-const bookingPlans = new Set<string>();
+type DesiredVote = { token: number; optionId: string; phone: string };
+type WrittenBooking = { planId: string; googleEventId: string | null; phone: string };
+
+const desiredVote = new Map<string, DesiredVote>();
+const voteTail = new Map<string, Promise<void>>();
+const lastPollBooking = new Map<string, WrittenBooking>();
+let voteToken = 0;
 
 const settleTimers = new Map<string, Timer>();
 
@@ -400,7 +407,10 @@ export async function bookDirect(input: {
   locus: "in_person" | "remote";
   requestText?: string;
   ignoreConflict?: boolean;
-}): Promise<string | Offer> {
+  skipSync?: boolean;
+  stillCurrent?: () => boolean;
+  written?: WrittenBooking;
+}): Promise<string | Offer | { stale: true }> {
   const person = await upsertPerson(input.phone);
   await addMember(input.threadId, person.id);
   const start = new Date(input.start);
@@ -410,7 +420,8 @@ export async function bookDirect(input: {
     return offerTimes({ ...input, requested: undefined });
   }
   const end = addMinutes(start, durationMin);
-  await syncCalendars(input.threadId, [person]);
+  if (!input.skipSync) await syncCalendars(input.threadId, [person]);
+  if (input.stillCurrent && !input.stillCurrent()) return { stale: true };
   const ranges = await loadRanges(input.threadId, [person.id]);
   const bufferMin = input.locus === "in_person" ? 30 : 0;
   const conflict = input.ignoreConflict ? undefined : ranges.find((range) => (
@@ -431,6 +442,7 @@ export async function bookDirect(input: {
     });
   }
 
+  if (input.stillCurrent && !input.stillCurrent()) return { stale: true };
   await replaceProposed(input.threadId);
   const planId = await createPlan({
     threadId: input.threadId,
@@ -440,6 +452,10 @@ export async function bookDirect(input: {
     options: [{ label: optionLabel(start, new Date()), start, end, yes: 1 }],
   });
   await markBooked(planId);
+  if (input.written) {
+    input.written.planId = planId;
+    input.written.phone = input.phone;
+  }
   const template = templateUrl(input.title, start, end);
   let googleEventId: string | null = null;
   let htmlLink: string | null = null;
@@ -455,6 +471,7 @@ export async function bookDirect(input: {
       });
       googleEventId = created?.id ?? null;
       htmlLink = created?.htmlLink ?? null;
+      if (input.written) input.written.googleEventId = googleEventId;
     } catch (error) {
       console.error("event insert failed", error instanceof Error ? error.message : error);
     }
@@ -506,7 +523,12 @@ async function pendingFromPlan(threadId: string, phone?: string): Promise<Pendin
   };
 }
 
-export async function applyOverride(threadId: string, phone?: string): Promise<string> {
+export async function applyOverride(
+  threadId: string,
+  phone?: string,
+  watch?: { stillCurrent: () => boolean; written: WrittenBooking },
+): Promise<string> {
+  if (watch && !watch.stillCurrent()) return "I left that time alone.";
   const pending = pendingOverrides.get(threadId) ?? await pendingFromPlan(threadId, phone);
   if (!pending) return "I don't have a conflicting time to replace. Tell me which time you want.";
   pendingOverrides.delete(threadId);
@@ -535,8 +557,12 @@ export async function applyOverride(threadId: string, phone?: string): Promise<s
     durationMin: pending.durationMin,
     locus: pending.locus,
     ignoreConflict: true,
+    skipSync: true,
+    stillCurrent: watch?.stillCurrent,
+    written: watch?.written,
   });
-  return typeof booked === "string" ? booked : booked.text;
+  if (typeof booked !== "string") return "stale" in booked ? "I left that time alone." : booked.text;
+  return booked;
 }
 
 export async function publishPoll(space: Sendable, offer: Offer): Promise<void> {
@@ -547,17 +573,21 @@ export async function publishPoll(space: Sendable, offer: Offer): Promise<void> 
   if (offer.preface) await space.send(offer.preface);
   try {
     const sent = await space.send(poll(offer.poll.title, offer.poll.labels)) as {
+      id?: string;
       content?: { type?: string; pollMessageGuid?: string; options?: { title: string; optionIdentifier?: string }[] };
     };
-    if (sent?.content?.type === "poll") {
-      await attachPoll(offer.poll.planId, sent.content.pollMessageGuid, sent.content.options ?? []);
-    } else {
-      console.log("poll sent without option identifiers", sent?.content?.type);
-    }
+    const guid = sent?.content?.type === "poll" ? sent.content.pollMessageGuid ?? sent.id : sent?.id;
+    const options = sent?.content?.type === "poll" ? sent.content.options ?? [] : [];
+    if (guid || options.length > 0) await attachPoll(offer.poll.planId, guid, options);
   } catch (error) {
     console.error("poll send failed", error instanceof Error ? error.message : error);
     await space.send(offer.text);
   }
+}
+
+export function cancelPollChoice(planId: string, optionId: string): void {
+  const want = desiredVote.get(planId);
+  if (want?.optionId === optionId) desiredVote.delete(planId);
 }
 
 export async function bookPollChoice(input: {
@@ -566,40 +596,88 @@ export async function bookPollChoice(input: {
   optionId: string;
   phone: string;
 }): Promise<void> {
-  if (bookingPlans.has(input.planId)) return;
-  const option = await getPlanOption(input.optionId);
-  const plan = await getPlan(input.planId);
-  if (!option || !plan || plan.status !== "proposed") return;
-  bookingPlans.add(input.planId);
+  const token = ++voteToken;
+  desiredVote.set(input.planId, { token, optionId: input.optionId, phone: input.phone });
+  const previous = voteTail.get(input.planId) ?? Promise.resolve();
+  const run = previous
+    .catch((error: unknown) => {
+      console.error("poll booking failed", error instanceof Error ? error.message : error);
+    })
+    .then(() => settlePollVote(input.space, input.planId, token));
+  voteTail.set(input.planId, run);
+  await run;
+}
+
+async function settlePollVote(space: Sendable, planId: string, token: number): Promise<void> {
+  const want = desiredVote.get(planId);
+  if (!want || want.token !== token) return;
+  const option = await getPlanOption(want.optionId);
+  const plan = await getPlan(planId);
+  if (!option || !plan) return;
+  const still = () => desiredVote.get(planId)?.token === token;
+  if (!still()) return;
+  const previous = lastPollBooking.get(planId);
+  if (previous?.planId) {
+    await revertWritten(previous);
+    lastPollBooking.delete(planId);
+  }
+  if (!still()) return;
   const locus = plan.locus === "in_person" ? "in_person" : "remote";
-  try {
-    if (option.label === "Override") {
-      pendingOverrides.set(plan.thread_id, {
-        phone: input.phone,
-        title: plan.title,
-        start: new Date(option.start_at),
-        durationMin: plan.duration_minutes,
-        locus,
-      });
-      const text = await applyOverride(plan.thread_id);
-      if (text.startsWith("I couldn't delete") || text.startsWith("I don't have")) bookingPlans.delete(input.planId);
-      await input.space.send(text);
-      return;
-    }
-    const result = await bookDirect({
+  const written: WrittenBooking = { planId: "", googleEventId: null, phone: want.phone };
+  console.log("booking poll choice", option.label, want.optionId);
+  let result: string | Offer | { stale: true };
+  if (option.label === "Override") {
+    pendingOverrides.set(plan.thread_id, {
+      phone: want.phone,
+      title: plan.title,
+      start: new Date(option.start_at),
+      durationMin: plan.duration_minutes,
+      locus,
+    });
+    result = await applyOverride(plan.thread_id, want.phone, { stillCurrent: still, written });
+  } else {
+    result = await bookDirect({
       threadId: plan.thread_id,
-      phone: input.phone,
+      phone: want.phone,
       title: plan.title,
       start: new Date(option.start_at).toISOString(),
       durationMin: plan.duration_minutes,
       locus,
+      skipSync: true,
+      stillCurrent: still,
+      written,
     });
-    if (typeof result === "string") await input.space.send(result);
-    else await publishPoll(input.space, result);
-  } catch (error) {
-    bookingPlans.delete(input.planId);
-    throw error;
   }
+  if (typeof result !== "string" && "stale" in result) return;
+  if (!still()) {
+    if (written.planId) await revertWritten(written);
+    return;
+  }
+  if (written.planId) lastPollBooking.set(planId, { ...written });
+  if (typeof result === "string") await space.send(result);
+  else await publishPoll(space, result);
+  if (!still()) {
+    if (written.planId) {
+      await revertWritten(written);
+      lastPollBooking.delete(planId);
+    }
+    return;
+  }
+  if (desiredVote.get(planId)?.token === token) desiredVote.delete(planId);
+}
+
+async function revertWritten(written: WrittenBooking): Promise<void> {
+  const person = await upsertPerson(written.phone);
+  if (written.googleEventId && person.google_refresh_token) {
+    try {
+      const token = await accessToken(person.id, person.google_refresh_token);
+      await deleteEvent(token, written.googleEventId);
+    } catch (error) {
+      console.error("poll rebooking delete failed", error instanceof Error ? error.message : error);
+    }
+  }
+  await forgetBooking(written.planId);
+  await retirePlan(written.planId);
 }
 
 export { isOverride };

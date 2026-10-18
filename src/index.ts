@@ -1,6 +1,6 @@
 import { imessage } from "@spectrum-ts/imessage";
 import { Spectrum } from "spectrum-ts";
-import { bookPollChoice, linkMembers, syncMembers } from "./actions.ts";
+import { bookPollChoice, cancelPollChoice, linkMembers, syncMembers } from "./actions.ts";
 import { runTurn } from "./agent.ts";
 import { findOption, insertMessage, migrate, recordVote, recentMessages, upsertPerson, upsertThread } from "./db.ts";
 import { env } from "./env.ts";
@@ -34,15 +34,23 @@ for await (const [space, message] of app.messages) {
         optionIdentifier: message.content.option.optionIdentifier,
         label: message.content.option.title,
       });
-      if (!match) continue;
+      if (!match) {
+        console.log("poll vote unmatched", message.content.option.optionIdentifier, message.content.option.title);
+        continue;
+      }
+      console.log("poll vote", message.content.selected, message.content.option.title);
       await recordVote(match.planId, match.optionId, person.id, message.content.selected);
       if (message.content.selected) {
-        await bookPollChoice({
+        void bookPollChoice({
           space: space as Parameters<typeof bookPollChoice>[0]["space"],
           planId: match.planId,
           optionId: match.optionId,
           phone,
+        }).catch((error: unknown) => {
+          console.error("poll booking failed", error instanceof Error ? error.message : error);
         });
+      } else {
+        cancelPollChoice(match.planId, match.optionId);
       }
       continue;
     }
