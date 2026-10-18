@@ -9,24 +9,44 @@ import { startServer } from "./http.ts";
 await migrate();
 startServer();
 
-const app = await Spectrum({
-  projectId: env.projectId,
-  projectSecret: env.projectSecret,
-  providers: [imessage.config()],
-});
-
 const pending = new Map<string, Timer>();
+const pollCommit = new Map<string, number>();
 
-console.log("secretary is listening for iMessage");
+type RunningApp = Awaited<ReturnType<typeof Spectrum>>;
+type Delivery = RunningApp["messages"] extends AsyncIterable<infer Pair> ? Pair : never;
 
-for await (const [space, message] of app.messages) {
+async function listen(): Promise<void> {
+  for (;;) {
+    const app = await Spectrum({
+      projectId: env.projectId,
+      projectSecret: env.projectSecret,
+      providers: [imessage.config()],
+    });
+    try {
+      console.log("secretary is listening for iMessage");
+      for await (const [space, message] of app.messages) {
+        await handleMessage(app, [space, message]);
+      }
+      console.error("iMessage stream ended; opening a fresh session");
+    } catch (error) {
+      console.error("listener failed", error instanceof Error ? error.message : error);
+    } finally {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+      await app.stop().catch(() => undefined);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+}
+
+async function handleMessage(app: RunningApp, [space, message]: Delivery): Promise<void> {
   try {
-    if (message.direction === "outbound") continue;
-    if (message.sender?.kind === "agent") continue;
+    if (message.direction === "outbound") return;
+    if (message.sender?.kind === "agent") return;
 
     if (message.content.type === "poll_option") {
       const phone = message.sender?.id;
-      if (!phone) continue;
+      if (!phone) return;
       const person = await upsertPerson(phone);
       const match = await findOption({
         spaceId: space.id,
@@ -36,11 +56,17 @@ for await (const [space, message] of app.messages) {
       });
       if (!match) {
         console.log("poll vote unmatched", message.content.option.optionIdentifier, message.content.option.title);
-        continue;
+        return;
       }
       console.log("poll vote", message.content.selected, message.content.option.title);
       await recordVote(match.planId, match.optionId, person.id, message.content.selected);
+      const committedAt = pollCommit.get(match.planId) ?? 0;
+      if (Date.now() - committedAt < 2_000) {
+        console.log("poll vote ignored while booking", message.content.option.title);
+        return;
+      }
       if (message.content.selected) {
+        pollCommit.set(match.planId, Date.now());
         void bookPollChoice({
           space: space as Parameters<typeof bookPollChoice>[0]["space"],
           planId: match.planId,
@@ -52,12 +78,12 @@ for await (const [space, message] of app.messages) {
       } else {
         cancelPollChoice(match.planId, match.optionId);
       }
-      continue;
+      return;
     }
 
-    if (message.content.type !== "text") continue;
+    if (message.content.type !== "text") return;
     const phone = message.sender?.id;
-    if (!phone || !message.content.text.trim()) continue;
+    if (!phone || !message.content.text.trim()) return;
 
     console.log("inbound", phone, message.content.text);
     const thread = await upsertThread(space.id);
@@ -94,3 +120,5 @@ for await (const [space, message] of app.messages) {
     console.error("message failed", error instanceof Error ? error.message : error);
   }
 }
+
+void listen();
